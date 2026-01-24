@@ -495,7 +495,7 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 )?;
 
                 let id = this.active_fiber_ref().id;
-                this.write_scalar(Scalar::from_u32(id.to_u32()), dest)?;
+                this.write_scalar(Scalar::from_uint(id.to_u32(), dest.layout.size), dest)?;
             }
             "miri_fiber_switch" => {
                 todo!("miri_fiber_switch");
