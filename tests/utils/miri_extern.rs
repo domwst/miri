@@ -172,7 +172,7 @@ extern "Rust" {
     /// As far as Miri is concerned, this is equivalent to `yield_now`.
     pub fn miri_spin_loop();
 
-    pub fn miri_fiber_create(body: extern "Rust" fn(*mut ()), data: *mut ()) -> usize;
+    pub fn miri_fiber_create(body: extern "Rust" fn(*mut ()) -> !, data: *mut ()) -> usize;
 
     pub fn miri_fiber_current() -> usize;
 
