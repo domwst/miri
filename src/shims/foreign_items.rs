@@ -476,6 +476,33 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // Try to run another thread to maximize the chance of finding actual bugs.
                 this.yield_active_thread();
             }
+            "miri_fiber_create" => {
+                // FIXME: `check_shim_sig` does not work with function pointers.
+                let [body, data] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+                let start_routine = this.read_pointer(body)?;
+                let func_arg = this.read_immediate(data)?;
+
+                todo!("miri_fiber_create {start_routine:?} {func_arg:?}");
+                // this.create_fiber(start_routine, func_arg)?;
+            }
+            "miri_fiber_current" => {
+                let [] = this.check_shim_sig(
+                    shim_sig!(extern "Rust" fn() -> usize),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+
+                let id = this.active_fiber_ref().id;
+                this.write_scalar(Scalar::from_u32(id.to_u32()), dest)?;
+            }
+            "miri_fiber_switch" => {
+                todo!("miri_fiber_switch");
+            }
+            "miri_fiber_exit_to" => {
+                todo!("miri_fiber_exit_to");
+            }
             // Obtains the size of a Miri backtrace. See the README for details.
             "miri_backtrace_size" => {
                 this.handle_miri_backtrace_size(abi, link_name, args, dest)?;

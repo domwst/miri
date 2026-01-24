@@ -177,6 +177,10 @@ impl FiberId {
     pub fn new_unchecked(id: u32) -> Self {
         Self(id)
     }
+
+    pub fn to_usize(self) -> usize {
+        usize::try_from(self.0).unwrap()
+    }
 }
 
 impl Idx for FiberId {
@@ -185,7 +189,7 @@ impl Idx for FiberId {
     }
 
     fn index(self) -> usize {
-        usize::try_from(self.0).unwrap()
+        self.to_usize()
     }
 }
 
