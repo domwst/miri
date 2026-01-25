@@ -563,7 +563,7 @@ impl VisitProvenance for ThreadManager<'_> {
         for thread in threads {
             thread.visit_provenance(visit);
         }
-        for (_, fiber) in fibers {
+        for fiber in fibers.values() {
             fiber.visit_provenance(visit);
         }
         for ptr in thread_local_allocs.values() {
@@ -854,33 +854,19 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
     fn drop_fiber(&mut self, fiber: Fiber<'tcx>) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
-        let mut allocs: FxHashMap<AllocId, BorTag> = FxHashMap::default();
-
         for frame in &fiber.stack {
             for local in frame.locals.iter() {
+                // https://github.com/rust-lang/rust/blob/26f3337d4eda0ba22b615744fda0185d0ee344b1/compiler/rustc_const_eval/src/interpret/stack.rs#L587
+                // https://github.com/rust-lang/rust/blob/26f3337d4eda0ba22b615744fda0185d0ee344b1/compiler/rustc_const_eval/src/interpret/stack.rs#L180
+
                 let Some(local) = local.as_mplace_or_imm() else {
                     continue;
                 };
                 let Either::Left((ptr, _meta)) = local else {
                     continue;
                 };
-                let Some(Provenance::Concrete { alloc_id, tag }) = ptr.provenance else {
-                    continue;
-                };
-
-                // The same stack allocation can show up multiple times via moves/reborrows.
-                allocs.entry(alloc_id).or_insert(tag);
+                this.deallocate_ptr(ptr, None, MemoryKind::Stack)?;
             }
-        }
-
-        for (alloc_id, tag) in allocs {
-            // `deallocate_ptr` requires a pointer to the beginning of the allocation.
-            let base_addr = this.addr_from_alloc_id(alloc_id, Some(MemoryKind::Stack))?;
-            let base_ptr = Pointer::new(
-                Some(Provenance::Concrete { alloc_id, tag }),
-                Size::from_bytes(base_addr),
-            );
-            this.deallocate_ptr(base_ptr, None, MemoryKind::Stack)?;
         }
 
         drop(fiber);
