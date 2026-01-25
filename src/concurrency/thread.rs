@@ -515,7 +515,6 @@ impl FiberIdAllocator {
         FiberId::new_unchecked(id)
     }
 
-    #[allow(dead_code)]
     fn dealloc(&mut self, _id: FiberId) {}
 }
 
@@ -878,6 +877,7 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
 
         if exit {
             let old_slot = thread_manager.fibers.remove(&old_fiber.id);
+            thread_manager.fiber_id_allocator.dealloc(old_fiber.id);
             assert!(matches!(old_slot, Some(None)));
             // TODO: Is this enough?
             drop(old_fiber);
