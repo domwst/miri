@@ -6,7 +6,7 @@ use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
 use rand::seq::IteratorRandom;
-use rustc_abi::ExternAbi;
+use rustc_abi::{ExternAbi, Size};
 use rustc_const_eval::CTRL_C_RECEIVED;
 use rustc_data_structures::either::Either;
 use rustc_data_structures::fx::FxHashMap;
@@ -849,10 +849,52 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
         interp_ok(res)
     }
 
+    /// Drops a fiber deallocating all stack allocations to prevent
+    /// leak reports. This does *not* run Drop's of the local variables.
+    fn drop_fiber(&mut self, fiber: Fiber<'tcx>) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+
+        let mut allocs: FxHashMap<AllocId, BorTag> = FxHashMap::default();
+
+        for frame in &fiber.stack {
+            for local in frame.locals.iter() {
+                let Some(local) = local.as_mplace_or_imm() else {
+                    continue;
+                };
+                let Either::Left((ptr, _meta)) = local else {
+                    continue;
+                };
+                let Some(Provenance::Concrete { alloc_id, tag }) = ptr.provenance else {
+                    continue;
+                };
+
+                // The same stack allocation can show up multiple times via moves/reborrows.
+                allocs.entry(alloc_id).or_insert(tag);
+            }
+        }
+
+        for (alloc_id, tag) in allocs {
+            // `deallocate_ptr` requires a pointer to the beginning of the allocation.
+            let base_addr = this.addr_from_alloc_id(alloc_id, Some(MemoryKind::Stack))?;
+            let base_ptr = Pointer::new(
+                Some(Provenance::Concrete { alloc_id, tag }),
+                Size::from_bytes(base_addr),
+            );
+            this.deallocate_ptr(base_ptr, None, MemoryKind::Stack)?;
+        }
+
+        drop(fiber);
+
+        interp_ok(())
+    }
+
     fn handle_fiber_switch(
-        thread_manager: &mut ThreadManager<'tcx>,
+        &mut self,
         request: FiberSwitchRequest,
     ) -> InterpResult<'tcx, SchedulingAction> {
+        let this = self.eval_context_mut();
+        let thread_manager = &mut this.machine.threads;
+
         assert!(
             !thread_manager.yield_active_thread,
             "Thread {:?} requested both a fiber switch and a yield",
@@ -879,8 +921,7 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
             let old_slot = thread_manager.fibers.remove(&old_fiber.id);
             thread_manager.fiber_id_allocator.dealloc(old_fiber.id);
             assert!(matches!(old_slot, Some(None)));
-            // TODO: Is this enough?
-            drop(old_fiber);
+            this.drop_fiber(old_fiber)?;
         } else {
             let old_slot = thread_manager.fibers.insert(old_fiber.id, Some(old_fiber));
             assert!(matches!(old_slot, Some(None)));
@@ -929,20 +970,20 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
         }
 
         // We are not in GenMC mode, so we control the scheduling.
+        // If a fiber switch is requested, perform it before anything else.
+        if let Some(request) = this.machine.threads.fiber_switch_request.take() {
+            return this.handle_fiber_switch(request);
+        }
+
         let thread_manager = &mut this.machine.threads;
         let clock = &this.machine.monotonic_clock;
         let rng = this.machine.rng.get_mut();
         // This thread and the program can keep going.
         if thread_manager.active_thread_ref().state.is_enabled()
-            && !thread_manager.fiber_switch_request.is_some()
             && !thread_manager.yield_active_thread
         {
             // The currently active thread is still enabled, just continue with it.
             return interp_ok(SchedulingAction::ExecuteStep);
-        }
-
-        if let Some(request) = thread_manager.fiber_switch_request.take() {
-            return Self::handle_fiber_switch(thread_manager, request);
         }
 
         // The active thread yielded or got terminated. Let's see if there are any timeouts to take
