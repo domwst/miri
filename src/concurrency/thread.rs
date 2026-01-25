@@ -576,12 +576,15 @@ impl VisitProvenance for ThreadManager<'_> {
 impl<'tcx> ThreadManager<'tcx> {
     pub(crate) fn new(config: &MiriConfig) -> Self {
         let mut threads = IndexVec::new();
+        let mut fibers = FxHashMap::default();
         let mut fiber_id_allocator = FiberIdAllocator::new(config.seed);
         // Create the main thread and add it to the list of threads.
-        threads.push(Thread::new(Some("main"), None, fiber_id_allocator.alloc()));
+        let main_fiber_id = fiber_id_allocator.alloc();
+        threads.push(Thread::new(Some("main"), None, main_fiber_id));
+        fibers.insert(main_fiber_id, None);
         Self {
             fiber_id_allocator,
-            fibers: Default::default(),
+            fibers,
             active_thread: ThreadId::MAIN_THREAD,
             threads,
             thread_local_allocs: Default::default(),
@@ -654,6 +657,7 @@ impl<'tcx> ThreadManager<'tcx> {
         let new_thread_id = ThreadId::new(self.threads.len());
         let new_fiber_id = self.fiber_id_allocator.alloc();
         self.threads.push(Thread::new(None, Some(on_stack_empty), new_fiber_id));
+        self.fibers.insert(new_fiber_id, None);
         new_thread_id
     }
 
@@ -1071,6 +1075,34 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             Some(FiberSwitchRequest { fiber_id: FiberId::new_unchecked(fiber_id), exit });
 
         interp_ok(())
+    }
+
+    fn create_fiber(
+        &mut self,
+        body: Pointer,
+        func_arg: ImmTy<'tcx>,
+    ) -> InterpResult<'tcx, FiberId> {
+        let this = self.eval_context_mut();
+
+        let fiber_id = this.machine.threads.fiber_id_allocator.alloc();
+
+        let current_span = this.machine.current_user_relevant_span();
+        let fiber = Fiber::new(None, fiber_id);
+
+        let current_fiber =
+            core::mem::replace(this.machine.threads.active_thread_mut().current_fiber_mut(), fiber);
+
+        let instance = this.get_ptr_fn(body)?.as_instance()?;
+
+        this.call_thread_root_function(instance, ExternAbi::Rust, &[func_arg], None, current_span)?;
+
+        let fiber = core::mem::replace(
+            this.machine.threads.active_thread_mut().current_fiber_mut(),
+            current_fiber,
+        );
+        this.machine.threads.fibers.insert(fiber_id, Some(fiber));
+
+        interp_ok(fiber_id)
     }
 
     /// Start a regular (non-main) thread.

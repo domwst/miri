@@ -483,8 +483,8 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let start_routine = this.read_pointer(body)?;
                 let func_arg = this.read_immediate(data)?;
 
-                todo!("miri_fiber_create {start_routine:?} {func_arg:?}");
-                // this.create_fiber(start_routine, func_arg)?;
+                let id = this.create_fiber(start_routine, func_arg)?;
+                this.write_scalar(Scalar::from_uint(id.to_u32(), dest.layout.size), dest)?;
             }
             "miri_fiber_current" => {
                 let [] = this.check_shim_sig(
@@ -512,6 +512,7 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 let [id] = this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
                 let id = this.read_target_usize(id)?;
                 this.switch_to_fiber(id, /* exit */ true)?;
+                return interp_ok(EmulateItemResult::AlreadyJumped);
             }
             // Obtains the size of a Miri backtrace. See the README for details.
             "miri_backtrace_size" => {
