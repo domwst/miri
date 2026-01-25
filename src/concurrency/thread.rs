@@ -306,6 +306,12 @@ impl<'fcx> Fiber<'fcx> {
     }
 }
 
+impl<'tcx> std::fmt::Debug for Fiber<'tcx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fiber_{}", self.id.to_u32())
+    }
+}
+
 impl VisitProvenance for Fiber<'_> {
     fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
         let Fiber {
@@ -513,10 +519,18 @@ impl FiberIdAllocator {
     fn dealloc(&mut self, _id: FiberId) {}
 }
 
+#[derive(Debug)]
+struct FiberSwitchRequest {
+    fiber_id: FiberId,
+    exit: bool,
+}
+
 /// A set of threads.
 #[derive(Debug)]
 pub struct ThreadManager<'tcx> {
     fiber_id_allocator: FiberIdAllocator,
+    fibers: FxHashMap<FiberId, Option<Fiber<'tcx>>>,
+
     /// Identifier of the currently active thread.
     active_thread: ThreadId,
     /// Threads used in the program.
@@ -525,6 +539,8 @@ pub struct ThreadManager<'tcx> {
     threads: IndexVec<ThreadId, Thread<'tcx>>,
     /// A mapping from a thread-local static to the thread specific allocation.
     thread_local_allocs: FxHashMap<(DefId, ThreadId), StrictPointer>,
+
+    fiber_switch_request: Option<FiberSwitchRequest>,
     /// A flag that indicates that we should change the active thread.
     /// Completely ignored in GenMC mode.
     yield_active_thread: bool,
@@ -536,15 +552,20 @@ impl VisitProvenance for ThreadManager<'_> {
     fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
         let ThreadManager {
             fiber_id_allocator: _,
+            fibers,
             threads,
             thread_local_allocs,
             active_thread: _,
+            fiber_switch_request: _,
             yield_active_thread: _,
             fixed_scheduling: _,
         } = self;
 
         for thread in threads {
             thread.visit_provenance(visit);
+        }
+        for (_, fiber) in fibers {
+            fiber.visit_provenance(visit);
         }
         for ptr in thread_local_allocs.values() {
             ptr.visit_provenance(visit);
@@ -560,9 +581,11 @@ impl<'tcx> ThreadManager<'tcx> {
         threads.push(Thread::new(Some("main"), None, fiber_id_allocator.alloc()));
         Self {
             fiber_id_allocator,
+            fibers: Default::default(),
             active_thread: ThreadId::MAIN_THREAD,
             threads,
             thread_local_allocs: Default::default(),
+            fiber_switch_request: None,
             yield_active_thread: false,
             fixed_scheduling: config.fixed_scheduling,
         }
@@ -823,6 +846,45 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
         interp_ok(res)
     }
 
+    fn handle_fiber_switch(
+        thread_manager: &mut ThreadManager<'tcx>,
+        request: FiberSwitchRequest,
+    ) -> InterpResult<'tcx, SchedulingAction> {
+        assert!(
+            !thread_manager.yield_active_thread,
+            "Thread {:?} requested both a fiber switch and a yield",
+            thread_manager.active_thread_ref()
+        );
+        let FiberSwitchRequest { fiber_id: target_fiber_id, exit } = request;
+
+        let Some(fiber) = thread_manager.fibers.get_mut(&target_fiber_id) else {
+            throw_machine_stop!(TerminationInfo::Abort(format!(
+                "fiber switch requested for fiber {}, but it does not exist",
+                target_fiber_id.to_u32()
+            )));
+        };
+        let Some(fiber) = fiber.take() else {
+            throw_machine_stop!(TerminationInfo::Abort(format!(
+                "fiber switch requested for fiber {} but it is currently executing",
+                target_fiber_id.to_u32()
+            )));
+        };
+        let old_fiber =
+            core::mem::replace(thread_manager.active_thread_mut().current_fiber_mut(), fiber);
+
+        if exit {
+            let old_slot = thread_manager.fibers.remove(&old_fiber.id);
+            assert!(matches!(old_slot, Some(None)));
+            // TODO: Is this enough?
+            drop(old_fiber);
+        } else {
+            let old_slot = thread_manager.fibers.insert(old_fiber.id, Some(old_fiber));
+            assert!(matches!(old_slot, Some(None)));
+        }
+
+        interp_ok(SchedulingAction::ExecuteStep)
+    }
+
     /// Decide which action to take next and on which thread.
     ///
     /// The currently implemented scheduling policy is the one that is commonly
@@ -867,12 +929,18 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
         let clock = &this.machine.monotonic_clock;
         let rng = this.machine.rng.get_mut();
         // This thread and the program can keep going.
-        if thread_manager.threads[thread_manager.active_thread].state.is_enabled()
+        if thread_manager.active_thread_ref().state.is_enabled()
+            && !thread_manager.fiber_switch_request.is_some()
             && !thread_manager.yield_active_thread
         {
             // The currently active thread is still enabled, just continue with it.
             return interp_ok(SchedulingAction::ExecuteStep);
         }
+
+        if let Some(request) = thread_manager.fiber_switch_request.take() {
+            return Self::handle_fiber_switch(thread_manager, request);
+        }
+
         // The active thread yielded or got terminated. Let's see if there are any timeouts to take
         // care of. We do this *before* running any other thread, to ensure that timeouts "in the
         // past" fire before any other thread can take an action. This ensures that for
@@ -985,6 +1053,24 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             this.machine.threads.set_thread_local_alloc(def_id, ptr);
             interp_ok(ptr)
         }
+    }
+
+    fn switch_to_fiber(
+        &mut self,
+        fiber_id: impl TryInto<u32> + Copy + std::fmt::Display,
+        exit: bool,
+    ) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        let thread_manager = &mut this.machine.threads;
+
+        let Ok(fiber_id) = fiber_id.try_into() else {
+            throw_machine_stop!(TerminationInfo::Abort(format!("fiber {fiber_id} doesn't exist",)));
+        };
+
+        thread_manager.fiber_switch_request =
+            Some(FiberSwitchRequest { fiber_id: FiberId::new_unchecked(fiber_id), exit });
+
+        interp_ok(())
     }
 
     /// Start a regular (non-main) thread.
