@@ -6,7 +6,7 @@ use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
 use rand::seq::IteratorRandom;
-use rustc_abi::{ExternAbi, Size};
+use rustc_abi::ExternAbi;
 use rustc_const_eval::CTRL_C_RECEIVED;
 use rustc_data_structures::either::Either;
 use rustc_data_structures::fx::FxHashMap;
