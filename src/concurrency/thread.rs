@@ -233,6 +233,11 @@ pub struct Fiber<'fcx> {
     /// A span that explains where the fiber (or more specifically, its current root
     /// frame) "comes from".
     pub(crate) origin_span: Span,
+
+    /// Lazyly-allocated non-atomic memory location that is written to on every switch to and
+    /// from this fiber. Used to detect data races between previous switch from this fiber and
+    /// the next switch to this fiber.
+    pub(crate) race_token: Option<MPlaceTy<'fcx>>,
 }
 
 impl<'fcx> Fiber<'fcx> {
@@ -302,6 +307,7 @@ impl<'fcx> Fiber<'fcx> {
             top_user_relevant_frame: None,
             unwind_payloads: Vec::new(),
             on_stack_empty,
+            race_token: None,
         }
     }
 }
@@ -321,6 +327,7 @@ impl VisitProvenance for Fiber<'_> {
             top_user_relevant_frame: _,
             unwind_payloads: panic_payload,
             on_stack_empty: _, // we assume the closure captures no GC-relevant state
+            race_token,
         } = self;
 
         for payload in panic_payload {
@@ -330,6 +337,8 @@ impl VisitProvenance for Fiber<'_> {
         for frame in stack {
             frame.visit_provenance(visit);
         }
+
+        race_token.visit_provenance(visit);
     }
 }
 
@@ -395,15 +404,11 @@ impl<'tcx> std::fmt::Debug for Thread<'tcx> {
 }
 
 impl<'tcx> Thread<'tcx> {
-    fn new(
-        name: Option<&str>,
-        on_stack_empty: Option<StackEmptyCallback<'tcx>>,
-        fiber_id: FiberId,
-    ) -> Self {
+    fn new(name: Option<&str>, fiber: Fiber<'tcx>) -> Self {
         Self {
             state: ThreadState::Enabled,
             thread_name: name.map(|name| Vec::from(name.as_bytes())),
-            current_fiber: Fiber::new(on_stack_empty, fiber_id),
+            current_fiber: fiber,
             join_status: ThreadJoinStatus::Joinable,
             last_error: None,
         }
@@ -579,7 +584,8 @@ impl<'tcx> ThreadManager<'tcx> {
         let mut fiber_id_allocator = FiberIdAllocator::new(config.seed);
         // Create the main thread and add it to the list of threads.
         let main_fiber_id = fiber_id_allocator.alloc();
-        threads.push(Thread::new(Some("main"), None, main_fiber_id));
+        let main_fiber = Fiber::new(None, main_fiber_id);
+        threads.push(Thread::new(Some("main"), main_fiber));
         fibers.insert(main_fiber_id, None);
         Self {
             fiber_id_allocator,
@@ -655,7 +661,8 @@ impl<'tcx> ThreadManager<'tcx> {
     fn create_thread(&mut self, on_stack_empty: StackEmptyCallback<'tcx>) -> ThreadId {
         let new_thread_id = ThreadId::new(self.threads.len());
         let new_fiber_id = self.fiber_id_allocator.alloc();
-        self.threads.push(Thread::new(None, Some(on_stack_empty), new_fiber_id));
+        let new_fiber = Fiber::new(Some(on_stack_empty), new_fiber_id);
+        self.threads.push(Thread::new(None, new_fiber));
         self.fibers.insert(new_fiber_id, None);
         new_thread_id
     }
@@ -874,42 +881,61 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 
+    fn touch_fiber_race_token(&mut self, fiber: &mut Fiber<'tcx>) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        let race_token = match fiber.race_token {
+            Some(ref mut race_token) => race_token,
+            None => {
+                let race_token =
+                    this.allocate(this.machine.layouts.u8, MiriMemoryKind::Machine.into())?;
+                fiber.race_token.insert(race_token)
+            }
+        };
+        this.write_scalar(Scalar::from_u8(0), race_token)?;
+
+        interp_ok(())
+    }
+
     fn handle_fiber_switch(
         &mut self,
         request: FiberSwitchRequest,
     ) -> InterpResult<'tcx, SchedulingAction> {
         let this = self.eval_context_mut();
-        let thread_manager = &mut this.machine.threads;
 
         assert!(
-            !thread_manager.yield_active_thread,
+            !this.machine.threads.yield_active_thread,
             "Thread {:?} requested both a fiber switch and a yield",
-            thread_manager.active_thread_ref()
+            this.machine.threads.active_thread_ref()
         );
         let FiberSwitchRequest { fiber_id: target_fiber_id, exit } = request;
 
-        let Some(fiber) = thread_manager.fibers.get_mut(&target_fiber_id) else {
+        let Some(fiber) = this.machine.threads.fibers.get_mut(&target_fiber_id) else {
             throw_machine_stop!(TerminationInfo::Abort(format!(
                 "fiber switch requested for fiber {}, but it does not exist",
                 target_fiber_id.to_u32()
             )));
         };
-        let Some(fiber) = fiber.take() else {
+        let Some(mut fiber) = fiber.take() else {
             throw_machine_stop!(TerminationInfo::Abort(format!(
                 "fiber switch requested for fiber {} but it is currently executing",
                 target_fiber_id.to_u32()
             )));
         };
-        let old_fiber =
-            core::mem::replace(thread_manager.active_thread_mut().current_fiber_mut(), fiber);
+
+        this.touch_fiber_race_token(&mut fiber)?;
+
+        let mut old_fiber =
+            core::mem::replace(this.machine.threads.active_thread_mut().current_fiber_mut(), fiber);
+
+        this.touch_fiber_race_token(&mut old_fiber)?;
 
         if exit {
-            let old_slot = thread_manager.fibers.remove(&old_fiber.id);
-            thread_manager.fiber_id_allocator.dealloc(old_fiber.id);
+            let old_slot = this.machine.threads.fibers.remove(&old_fiber.id);
+            this.machine.threads.fiber_id_allocator.dealloc(old_fiber.id);
             assert!(matches!(old_slot, Some(None)));
             this.drop_fiber(old_fiber)?;
         } else {
-            let old_slot = thread_manager.fibers.insert(old_fiber.id, Some(old_fiber));
+            let old_slot = this.machine.threads.fibers.insert(old_fiber.id, Some(old_fiber));
             assert!(matches!(old_slot, Some(None)));
         }
 
@@ -1114,7 +1140,9 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let fiber_id = this.machine.threads.fiber_id_allocator.alloc();
 
         let current_span = this.machine.current_user_relevant_span();
-        let fiber = Fiber::new(None, fiber_id);
+        let mut fiber = Fiber::new(None, fiber_id);
+
+        this.touch_fiber_race_token(&mut fiber)?;
 
         let current_fiber =
             core::mem::replace(this.machine.threads.active_thread_mut().current_fiber_mut(), fiber);

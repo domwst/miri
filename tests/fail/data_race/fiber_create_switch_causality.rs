@@ -8,7 +8,6 @@ use std::thread::scope;
 static PARENT_FIBER: AtomicUsize = AtomicUsize::new(0);
 
 fn fiber_body(_arg: *mut ()) -> ! {
-    println!("Fiber body");
     unsafe { utils::miri_fiber_exit_to(PARENT_FIBER.load(Ordering::Relaxed)) }
 }
 
@@ -30,7 +29,7 @@ fn main() {
             s.spawn(|| {
                 PARENT_FIBER.store(utils::miri_fiber_current(), Ordering::Relaxed);
                 let f = fiber.load(Ordering::Relaxed);
-                utils::miri_fiber_switch(f);
+                utils::miri_fiber_switch(f); //~ ERROR: Data race detected between (1) non-atomic write on thread `unnamed-1` and (2) non-atomic write on thread `unnamed-2` at alloc1662
             });
         });
     }
