@@ -923,8 +923,11 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
 
         if this.machine.threads.active_thread_ref().is_unwinding() {
             throw_unsup_format!(
-                "Thread {:?} requested a fiber switch while unwinding",
-                this.machine.threads.active_thread_ref()
+                "Thread {} requested a fiber switch while unwinding",
+                this.machine
+                    .threads
+                    .active_thread_ref()
+                    .thread_display_name(this.machine.threads.active_thread())
             );
         }
         let FiberSwitchRequest { fiber_id: target_fiber_id, exit } = request;
