@@ -2,7 +2,7 @@
 mod utils;
 
 use std::hint::spin_loop;
-use std::sync::atomic::{AtomicUsize, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::thread::scope;
 
 static PARENT_FIBER: AtomicUsize = AtomicUsize::new(0);
@@ -48,4 +48,3 @@ fn main() {
         });
     }
 }
-

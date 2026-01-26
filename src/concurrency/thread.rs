@@ -220,16 +220,6 @@ pub struct Fiber<'fcx> {
     /// maintained inside `MiriMachine::after_stack_push` and `MiriMachine::after_stack_pop`.
     top_user_relevant_frame: Option<usize>,
 
-    /// Stack of active unwind payloads for the current thread. Used for storing
-    /// the argument of the call to `miri_start_unwind` (the payload) when unwinding.
-    /// This is pointer-sized, and matches the `Payload` type in `src/libpanic_unwind/miri.rs`.
-    ///
-    /// In real unwinding, the payload gets passed as an argument to the landing pad,
-    /// which then forwards it to 'Resume'. However this argument is implicit in MIR,
-    /// so we have to store it out-of-band. When there are multiple active unwinds,
-    /// the innermost one is always caught first, so we can store them as a stack.
-    pub(crate) unwind_payloads: Vec<ImmTy<'fcx>>,
-
     /// A span that explains where the fiber (or more specifically, its current root
     /// frame) "comes from".
     pub(crate) origin_span: Span,
@@ -305,7 +295,6 @@ impl<'fcx> Fiber<'fcx> {
             stack: Vec::new(),
             origin_span: DUMMY_SP,
             top_user_relevant_frame: None,
-            unwind_payloads: Vec::new(),
             on_stack_empty,
             race_token: None,
         }
@@ -325,14 +314,9 @@ impl VisitProvenance for Fiber<'_> {
             stack,
             origin_span: _,
             top_user_relevant_frame: _,
-            unwind_payloads: panic_payload,
             on_stack_empty: _, // we assume the closure captures no GC-relevant state
             race_token,
         } = self;
-
-        for payload in panic_payload {
-            payload.visit_provenance(visit);
-        }
 
         for frame in stack {
             frame.visit_provenance(visit);
@@ -354,6 +338,19 @@ pub struct Thread<'tcx> {
 
     /// The join status.
     join_status: ThreadJoinStatus,
+
+    /// Stack of active unwind payloads for the current thread. Used for storing
+    /// the argument of the call to `miri_start_unwind` (the payload) when unwinding.
+    /// This is pointer-sized, and matches the `Payload` type in `src/libpanic_unwind/miri.rs`.
+    ///
+    /// In real unwinding, the payload gets passed as an argument to the landing pad,
+    /// which then forwards it to 'Resume'. However this argument is implicit in MIR,
+    /// so we have to store it out-of-band. When there are multiple active unwinds,
+    /// the innermost one is always caught first, so we can store them as a stack.
+    ///
+    /// Currently Miri doesn't support switching stacks during unwinding, so this attribute
+    /// is per-thread racher than per-fiber.
+    pub(crate) unwind_payloads: Vec<ImmTy<'tcx>>,
 
     /// Last OS error location in memory. It is a 32-bit integer.
     pub(crate) last_error: Option<MPlaceTy<'tcx>>,
@@ -389,6 +386,10 @@ impl<'tcx> Thread<'tcx> {
     pub fn current_fiber_mut(&mut self) -> &mut Fiber<'tcx> {
         &mut self.current_fiber
     }
+
+    pub fn is_unwinding(&self) -> bool {
+        !self.unwind_payloads.is_empty()
+    }
 }
 
 impl<'tcx> std::fmt::Debug for Thread<'tcx> {
@@ -410,6 +411,7 @@ impl<'tcx> Thread<'tcx> {
             thread_name: name.map(|name| Vec::from(name.as_bytes())),
             current_fiber: fiber,
             join_status: ThreadJoinStatus::Joinable,
+            unwind_payloads: Vec::new(),
             last_error: None,
         }
     }
@@ -417,7 +419,18 @@ impl<'tcx> Thread<'tcx> {
 
 impl VisitProvenance for Thread<'_> {
     fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
-        let Thread { current_fiber, last_error, state: _, thread_name: _, join_status: _ } = self;
+        let Thread {
+            current_fiber,
+            last_error,
+            unwind_payloads: panic_payload,
+            state: _,
+            thread_name: _,
+            join_status: _,
+        } = self;
+
+        for payload in panic_payload {
+            payload.visit_provenance(visit);
+        }
 
         current_fiber.visit_provenance(visit);
         last_error.visit_provenance(visit);
@@ -907,6 +920,13 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
             "Thread {:?} requested both a fiber switch and a yield",
             this.machine.threads.active_thread_ref()
         );
+
+        if this.machine.threads.active_thread_ref().is_unwinding() {
+            throw_unsup_format!(
+                "Thread {:?} requested a fiber switch while unwinding",
+                this.machine.threads.active_thread_ref()
+            );
+        }
         let FiberSwitchRequest { fiber_id: target_fiber_id, exit } = request;
 
         let Some(fiber) = this.machine.threads.fibers.get_mut(&target_fiber_id) else {
