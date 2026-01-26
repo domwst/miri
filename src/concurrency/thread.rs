@@ -200,19 +200,18 @@ impl From<FiberId> for u64 {
 }
 
 /// A fiber
-pub struct Fiber<'fcx> {
+pub struct Fiber<'tcx> {
     /// Id of the fiber
-    #[allow(dead_code)] // TODO: Remove
     pub(crate) id: FiberId,
 
     /// The virtual call stack.
-    stack: Vec<Frame<'fcx, Provenance, FrameExtra<'fcx>>>,
+    stack: Vec<Frame<'tcx, Provenance, FrameExtra<'tcx>>>,
 
     /// The function to call when the stack ran empty, to figure out what to do next.
     /// Conceptually, this is the interpreter implementation of the things that happen 'after' the
     /// Rust language entry point for this thread returns (usually implemented by the C or OS runtime).
     /// (`None` is an error, it means the callback has not been set up yet or is actively running.)
-    pub(crate) on_stack_empty: Option<StackEmptyCallback<'fcx>>,
+    pub(crate) on_stack_empty: Option<StackEmptyCallback<'tcx>>,
 
     /// The index of the topmost user-relevant frame in `stack`. This field must contain
     /// the value produced by `get_top_user_relevant_frame`.
@@ -227,10 +226,10 @@ pub struct Fiber<'fcx> {
     /// Lazyly-allocated non-atomic memory location that is written to on every switch to and
     /// from this fiber. Used to detect data races between previous switch from this fiber and
     /// the next switch to this fiber.
-    pub(crate) race_token: Option<MPlaceTy<'fcx>>,
+    pub(crate) race_token: Option<MPlaceTy<'tcx>>,
 }
 
-impl<'fcx> Fiber<'fcx> {
+impl<'tcx> Fiber<'tcx> {
     /// Return the top user-relevant frame, if there is one. `skip` indicates how many top frames
     /// should be skipped.
     /// Note that the choice to return `None` here when there is no user-relevant frame is part of
@@ -289,7 +288,7 @@ impl<'fcx> Fiber<'fcx> {
             .unwrap_or(rustc_span::DUMMY_SP)
     }
 
-    fn new(on_stack_empty: Option<StackEmptyCallback<'fcx>>, id: FiberId) -> Self {
+    fn new(on_stack_empty: Option<StackEmptyCallback<'tcx>>, id: FiberId) -> Self {
         Self {
             id,
             stack: Vec::new(),
