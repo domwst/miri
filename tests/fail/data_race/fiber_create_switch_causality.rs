@@ -29,7 +29,7 @@ fn main() {
             s.spawn(|| {
                 PARENT_FIBER.store(utils::miri_fiber_current(), Ordering::Relaxed);
                 let f = fiber.load(Ordering::Relaxed);
-                utils::miri_fiber_switch(f); //~ ERROR: Data race detected between (1) non-atomic write on thread `unnamed-1` and (2) non-atomic write on thread `unnamed-2` at alloc1662
+                utils::miri_fiber_switch(f); //~ ERROR: Undefined Behavior: Data race detected between (1) non-atomic write on thread `unnamed-1` and (2) non-atomic write on thread `unnamed-2` at alloc1819
             });
         });
     }

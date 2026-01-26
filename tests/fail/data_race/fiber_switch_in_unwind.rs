@@ -12,7 +12,7 @@ fn fiber_body(_arg: *mut ()) -> ! {
     impl Drop for ExitOnDrop {
         fn drop(&mut self) {
             unsafe {
-                utils::miri_fiber_exit_to(PARENT_FIBER.load(Ordering::Relaxed)); //~ERROR: Thread main requested a fiber switch while unwinding
+                utils::miri_fiber_exit_to(PARENT_FIBER.load(Ordering::Relaxed)); //~ERROR: unsupported operation: Thread main requested a fiber switch while unwinding
             }
         }
     }
