@@ -204,6 +204,13 @@ pub struct Fiber<'tcx> {
     /// Id of the fiber
     pub(crate) id: FiberId,
 
+    /// `None` means the fiber was created by `miri_fiber_create`
+    /// and its body can't terminate normally.
+    /// `Some(origin)` means the fiber was createdy during creation
+    /// of the thread `thread_id` and it has to terminate on the
+    /// same thread.
+    pub(crate) origin_thread: Option<ThreadId>,
+
     /// The virtual call stack.
     stack: Vec<Frame<'tcx, Provenance, FrameExtra<'tcx>>>,
 
@@ -288,9 +295,14 @@ impl<'tcx> Fiber<'tcx> {
             .unwrap_or(rustc_span::DUMMY_SP)
     }
 
-    fn new(on_stack_empty: Option<StackEmptyCallback<'tcx>>, id: FiberId) -> Self {
+    fn new(
+        on_stack_empty: Option<StackEmptyCallback<'tcx>>,
+        id: FiberId,
+        origin: Option<ThreadId>,
+    ) -> Self {
         Self {
             id,
+            origin_thread: origin,
             stack: Vec::new(),
             origin_span: DUMMY_SP,
             top_user_relevant_frame: None,
@@ -310,6 +322,7 @@ impl VisitProvenance for Fiber<'_> {
     fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
         let Fiber {
             id: _,
+            origin_thread: _,
             stack,
             origin_span: _,
             top_user_relevant_frame: _,
@@ -367,6 +380,10 @@ impl<'tcx> Thread<'tcx> {
     /// Return whether this thread is enabled or not.
     pub fn is_enabled(&self) -> bool {
         self.state.is_enabled()
+    }
+
+    fn is_terminated(&self) -> bool {
+        self.state.is_terminated()
     }
 
     /// Get the name of the current thread for display purposes; will include thread ID if not set.
@@ -596,7 +613,7 @@ impl<'tcx> ThreadManager<'tcx> {
         let mut fiber_id_allocator = FiberIdAllocator::new(config.seed);
         // Create the main thread and add it to the list of threads.
         let main_fiber_id = fiber_id_allocator.alloc();
-        let main_fiber = Fiber::new(None, main_fiber_id);
+        let main_fiber = Fiber::new(None, main_fiber_id, Some(ThreadId::MAIN_THREAD));
         threads.push(Thread::new(Some("main"), main_fiber));
         fibers.insert(main_fiber_id, None);
         Self {
@@ -673,7 +690,7 @@ impl<'tcx> ThreadManager<'tcx> {
     fn create_thread(&mut self, on_stack_empty: StackEmptyCallback<'tcx>) -> ThreadId {
         let new_thread_id = ThreadId::new(self.threads.len());
         let new_fiber_id = self.fiber_id_allocator.alloc();
-        let new_fiber = Fiber::new(Some(on_stack_empty), new_fiber_id);
+        let new_fiber = Fiber::new(Some(on_stack_empty), new_fiber_id, Some(new_thread_id));
         self.threads.push(Thread::new(None, new_fiber));
         self.fibers.insert(new_fiber_id, None);
         new_thread_id
@@ -703,17 +720,17 @@ impl<'tcx> ThreadManager<'tcx> {
     /// Get the total of threads that are currently live, i.e., not yet terminated.
     /// (They might be blocked.)
     pub fn get_live_thread_count(&self) -> usize {
-        self.threads.iter().filter(|t| !t.state.is_terminated()).count()
+        self.threads.iter().filter(|t| !t.is_terminated()).count()
     }
 
     /// Has the given thread terminated?
     fn has_terminated(&self, thread_id: ThreadId) -> bool {
-        self.threads[thread_id].state.is_terminated()
+        self.threads[thread_id].is_terminated()
     }
 
     /// Have all threads terminated?
     fn have_all_terminated(&self) -> bool {
-        self.threads.iter().all(|thread| thread.state.is_terminated())
+        self.threads.iter().all(|thread| thread.is_terminated())
     }
 
     /// Enable the thread for execution. The thread must be terminated.
@@ -748,7 +765,7 @@ impl<'tcx> ThreadManager<'tcx> {
         // NOTE: In GenMC mode, we treat detached threads like regular threads that are never joined, so there is no special handling required here.
         trace!("detaching {:?}", id);
 
-        let is_ub = if allow_terminated_joined && self.threads[id].state.is_terminated() {
+        let is_ub = if allow_terminated_joined && self.threads[id].is_terminated() {
             // "Detached" in particular means "not yet joined". Redundant detaching is still UB.
             self.threads[id].join_status == ThreadJoinStatus::Detached
         } else {
@@ -854,8 +871,38 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
     }
 
     #[inline]
+    fn check_current_fiber_origin(&self) -> InterpResult<'tcx> {
+        let this = self.eval_context_ref();
+        let active_thread = this.active_thread();
+        let fiber = this.active_fiber_ref();
+        match fiber.origin_thread {
+            None => {
+                // Fiber was created by `miri_fiber_create`.
+                throw_ub_format!(
+                    "body of the fiber {} has terminated normally on the thread {}",
+                    fiber.id.to_u32(),
+                    active_thread.to_u32()
+                );
+            }
+            Some(origin) if origin != active_thread => {
+                throw_ub_format!(
+                    "body of the fiber {} has terminated on the thread {}, but it was created as the body of thread {}",
+                    fiber.id.to_u32(),
+                    active_thread.to_u32(),
+                    origin.to_u32()
+                );
+            }
+            _ => interp_ok(()),
+        }
+    }
+
+    #[inline]
     fn run_on_stack_empty(&mut self) -> InterpResult<'tcx, Poll<()>> {
         let this = self.eval_context_mut();
+
+        // Check fiber origin before resetting origin span
+        this.check_current_fiber_origin()?;
+
         let active_thread = this.active_thread_mut();
         active_thread.current_fiber.origin_span = DUMMY_SP; // reset, the old value no longer applied
         let mut callback = active_thread
@@ -1072,7 +1119,7 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
             return interp_ok(SchedulingAction::ExecuteStep);
         }
         // We have not found a thread to execute.
-        if thread_manager.threads.iter().all(|thread| thread.state.is_terminated()) {
+        if thread_manager.threads.iter().all(|thread| thread.is_terminated()) {
             unreachable!("all threads terminated without the main thread terminating?!");
         } else if let Some(sleep_time) = potential_sleep_time {
             // All threads are currently blocked, but we have unexecuted
@@ -1163,7 +1210,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let fiber_id = this.machine.threads.fiber_id_allocator.alloc();
 
         let current_span = this.machine.current_user_relevant_span();
-        let mut fiber = Fiber::new(None, fiber_id);
+        let mut fiber = Fiber::new(None, fiber_id, None);
 
         this.touch_fiber_race_token(&mut fiber)?;
 
@@ -1431,7 +1478,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Mark the joined thread as being joined so that we detect if other
         // threads try to join it.
         thread_mgr.threads[joined_thread_id].join_status = ThreadJoinStatus::Joined;
-        if !thread_mgr.threads[joined_thread_id].state.is_terminated() {
+        if !thread_mgr.threads[joined_thread_id].is_terminated() {
             trace!(
                 "{:?} blocked on {:?} when trying to join",
                 thread_mgr.active_thread, joined_thread_id
