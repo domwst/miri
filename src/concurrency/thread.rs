@@ -933,16 +933,16 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
         let FiberSwitchRequest { fiber_id: target_fiber_id, exit } = request;
 
         let Some(fiber) = this.machine.threads.fibers.get_mut(&target_fiber_id) else {
-            throw_machine_stop!(TerminationInfo::Abort(format!(
+            throw_ub_format!(
                 "fiber switch requested for fiber {}, but it does not exist",
                 target_fiber_id.to_u32()
-            )));
+            );
         };
         let Some(mut fiber) = fiber.take() else {
-            throw_machine_stop!(TerminationInfo::Abort(format!(
+            throw_ub_format!(
                 "fiber switch requested for fiber {} but it is currently executing",
                 target_fiber_id.to_u32()
-            )));
+            );
         };
 
         this.touch_fiber_race_token(&mut fiber)?;
