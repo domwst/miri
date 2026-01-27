@@ -870,10 +870,11 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
 
     /// Drops a fiber deallocating all stack allocations to prevent
     /// leak reports. This does *not* run Drop's of the local variables.
-    fn drop_fiber(&mut self, fiber: Fiber<'tcx>) -> InterpResult<'tcx> {
+    fn drop_fiber(&mut self, mut fiber: Fiber<'tcx>) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
-        for frame in &fiber.stack {
+        while let Some(frame) = fiber.stack.pop() {
+            this.on_stack_pop(&frame)?;
             for local in frame.locals.iter() {
                 // https://github.com/rust-lang/rust/blob/26f3337d4eda0ba22b615744fda0185d0ee344b1/compiler/rustc_const_eval/src/interpret/stack.rs#L587
                 // https://github.com/rust-lang/rust/blob/26f3337d4eda0ba22b615744fda0185d0ee344b1/compiler/rustc_const_eval/src/interpret/stack.rs#L180
