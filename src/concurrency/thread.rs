@@ -1,5 +1,6 @@
 //! Implements threads.
 
+use std::collections::hash_map::{Entry, OccupiedEntry};
 use std::mem;
 use std::sync::atomic::Ordering::Relaxed;
 use std::task::Poll;
@@ -201,12 +202,12 @@ impl From<FiberId> for u64 {
 
 /// A fiber
 pub struct Fiber<'tcx> {
-    /// Id of the fiber
+    /// Id of the fiber.
     pub(crate) id: FiberId,
 
     /// `None` means the fiber was created by `miri_fiber_create`
     /// and its body can't terminate normally.
-    /// `Some(origin)` means the fiber was createdy during creation
+    /// `Some(origin)` means the fiber was created during creation
     /// of the thread `thread_id` and it has to terminate on the
     /// same thread.
     pub(crate) origin_thread: Option<ThreadId>,
@@ -828,6 +829,18 @@ impl<'tcx> ThreadManager<'tcx> {
     }
 }
 
+fn check_fiber_is_vacant<'tcx>(
+    entry: &mut OccupiedEntry<'_, FiberId, Option<Fiber<'tcx>>>,
+) -> InterpResult<'tcx, Fiber<'tcx>> {
+    match entry.get_mut().take() {
+        Some(fiber) => interp_ok(fiber),
+        None => {
+            let fiber_id = entry.key();
+            throw_ub_format!("target fiber {} is currently executing", fiber_id.to_u32())
+        }
+    }
+}
+
 impl<'tcx> EvalContextPrivExt<'tcx> for MiriInterpCx<'tcx> {}
 trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
     /// Execute a timeout callback on the callback's thread.
@@ -956,6 +969,20 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
         interp_ok(())
     }
 
+    fn find_fiber(
+        &mut self,
+        fiber_id: FiberId,
+    ) -> InterpResult<'tcx, OccupiedEntry<'_, FiberId, Option<Fiber<'tcx>>>> {
+        let this = self.eval_context_mut();
+        let thread_manager = &mut this.machine.threads;
+        match thread_manager.fibers.entry(fiber_id) {
+            Entry::Occupied(entry) => interp_ok(entry),
+            Entry::Vacant(_) => {
+                throw_ub_format!("target fiber {} doesn't exist", fiber_id.to_u32())
+            }
+        }
+    }
+
     fn handle_fiber_switch(
         &mut self,
         request: FiberSwitchRequest,
@@ -979,18 +1006,8 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
         }
         let FiberSwitchRequest { fiber_id: target_fiber_id, exit } = request;
 
-        let Some(fiber) = this.machine.threads.fibers.get_mut(&target_fiber_id) else {
-            throw_ub_format!(
-                "fiber switch requested for fiber {}, but it does not exist",
-                target_fiber_id.to_u32()
-            );
-        };
-        let Some(mut fiber) = fiber.take() else {
-            throw_ub_format!(
-                "fiber switch requested for fiber {} but it is currently executing",
-                target_fiber_id.to_u32()
-            );
-        };
+        let mut entry = this.find_fiber(target_fiber_id)?;
+        let mut fiber = check_fiber_is_vacant(&mut entry)?;
 
         this.touch_fiber_race_token(&mut fiber)?;
 
@@ -1182,7 +1199,20 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         }
     }
 
-    fn switch_to_fiber(
+    fn to_fiber_id(
+        fiber_id: impl TryInto<u32> + Copy + std::fmt::Display,
+    ) -> InterpResult<'tcx, FiberId> {
+        match fiber_id.try_into() {
+            Ok(v) => interp_ok(FiberId::new_unchecked(v)),
+            Err(_) => {
+                throw_machine_stop!(TerminationInfo::Abort(format!(
+                    "fiber {fiber_id} doesn't exist",
+                )))
+            }
+        }
+    }
+
+    fn handle_switch_to_fiber(
         &mut self,
         fiber_id: impl TryInto<u32> + Copy + std::fmt::Display,
         exit: bool,
@@ -1190,17 +1220,14 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
         let thread_manager = &mut this.machine.threads;
 
-        let Ok(fiber_id) = fiber_id.try_into() else {
-            throw_machine_stop!(TerminationInfo::Abort(format!("fiber {fiber_id} doesn't exist",)));
-        };
+        let fiber_id = Self::to_fiber_id(fiber_id)?;
 
-        thread_manager.fiber_switch_request =
-            Some(FiberSwitchRequest { fiber_id: FiberId::new_unchecked(fiber_id), exit });
+        thread_manager.fiber_switch_request = Some(FiberSwitchRequest { fiber_id, exit });
 
         interp_ok(())
     }
 
-    fn create_fiber(
+    fn handle_create_fiber(
         &mut self,
         body: Pointer,
         func_arg: ImmTy<'tcx>,
@@ -1228,6 +1255,19 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         this.machine.threads.fibers.insert(fiber_id, Some(fiber));
 
         interp_ok(fiber_id)
+    }
+
+    fn handle_destroy_fiber(
+        &mut self,
+        fiber_id: impl TryInto<u32> + Copy + std::fmt::Display,
+    ) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        let fiber_id = Self::to_fiber_id(fiber_id)?;
+        let mut entry = this.find_fiber(fiber_id)?;
+        let fiber = check_fiber_is_vacant(&mut entry)?;
+        entry.remove();
+        this.drop_fiber(fiber)?;
+        interp_ok(())
     }
 
     /// Start a regular (non-main) thread.
