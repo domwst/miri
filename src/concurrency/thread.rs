@@ -13,7 +13,7 @@ use rustc_data_structures::either::Either;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec};
-use rustc_middle::mir::Mutability;
+use rustc_middle::mir::{self, Mutability};
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_span::{DUMMY_SP, Span};
 use rustc_target::spec::Os;
@@ -553,17 +553,42 @@ impl FiberIdAllocator {
     fn dealloc(&mut self, _id: FiberId) {}
 }
 
+/// A suspended fiber, waiting to be resumed.
+/// Contains the fiber state and the memory location where the incoming payload
+/// should be written when the fiber is resumed.
 #[derive(Debug)]
-struct FiberSwitchRequest {
+struct SuspendedFiber<'tcx> {
+    fiber: Fiber<'tcx>,
+    /// The memory location where the incoming payload will be written when this fiber is resumed.
+    /// For newly created fibers, this points to the payload argument of the body function.
+    /// For suspended fibers, this points to the return place of miri_fiber_switch.
+    payload_place: MPlaceTy<'tcx>,
+}
+
+impl VisitProvenance for SuspendedFiber<'_> {
+    fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
+        let SuspendedFiber { fiber, payload_place } = self;
+        fiber.visit_provenance(visit);
+        payload_place.visit_provenance(visit);
+    }
+}
+
+#[derive(Debug)]
+struct FiberSwitchRequest<'tcx> {
     fiber_id: FiberId,
-    exit: bool,
+    /// The payload to pass to the target fiber.
+    payload: Scalar,
+    /// The place where the current fiber will receive its payload when resumed.
+    /// This is the return place of miri_fiber_switch (or None for exit_to).
+    payload_place: Option<MPlaceTy<'tcx>>,
 }
 
 /// A set of threads.
 #[derive(Debug)]
 pub struct ThreadManager<'tcx> {
     fiber_id_allocator: FiberIdAllocator,
-    fibers: FxHashMap<FiberId, Option<Fiber<'tcx>>>,
+    /// All currently existing fibers.
+    fibers: FxHashMap<FiberId, Option<SuspendedFiber<'tcx>>>,
 
     /// Identifier of the currently active thread.
     active_thread: ThreadId,
@@ -574,7 +599,7 @@ pub struct ThreadManager<'tcx> {
     /// A mapping from a thread-local static to the thread specific allocation.
     thread_local_allocs: FxHashMap<(DefId, ThreadId), StrictPointer>,
 
-    fiber_switch_request: Option<FiberSwitchRequest>,
+    fiber_switch_request: Option<FiberSwitchRequest<'tcx>>,
     /// A flag that indicates that we should change the active thread.
     /// Completely ignored in GenMC mode.
     yield_active_thread: bool,
@@ -598,8 +623,8 @@ impl VisitProvenance for ThreadManager<'_> {
         for thread in threads {
             thread.visit_provenance(visit);
         }
-        for fiber in fibers.values() {
-            fiber.visit_provenance(visit);
+        for suspended in fibers.values() {
+            suspended.visit_provenance(visit);
         }
         for ptr in thread_local_allocs.values() {
             ptr.visit_provenance(visit);
@@ -830,8 +855,8 @@ impl<'tcx> ThreadManager<'tcx> {
 }
 
 fn check_fiber_is_vacant<'tcx>(
-    entry: &mut OccupiedEntry<'_, FiberId, Option<Fiber<'tcx>>>,
-) -> InterpResult<'tcx, Fiber<'tcx>> {
+    entry: &mut OccupiedEntry<'_, FiberId, Option<SuspendedFiber<'tcx>>>,
+) -> InterpResult<'tcx, SuspendedFiber<'tcx>> {
     match entry.get_mut().take() {
         Some(fiber) => interp_ok(fiber),
         None => {
@@ -972,7 +997,7 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
     fn find_fiber(
         &mut self,
         fiber_id: FiberId,
-    ) -> InterpResult<'tcx, OccupiedEntry<'_, FiberId, Option<Fiber<'tcx>>>> {
+    ) -> InterpResult<'tcx, OccupiedEntry<'_, FiberId, Option<SuspendedFiber<'tcx>>>> {
         let this = self.eval_context_mut();
         let thread_manager = &mut this.machine.threads;
         match thread_manager.fibers.entry(fiber_id) {
@@ -985,16 +1010,13 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
 
     fn handle_fiber_switch(
         &mut self,
-        request: FiberSwitchRequest,
+        request: FiberSwitchRequest<'tcx>,
     ) -> InterpResult<'tcx, SchedulingAction> {
         let this = self.eval_context_mut();
 
-        assert!(
-            !this.machine.threads.yield_active_thread,
-            "Thread {:?} requested both a fiber switch and a yield",
-            this.machine.threads.active_thread_ref()
-        );
-
+        // By this point the thread might have requested yield (i.e. due to preemtion),
+        // that's ok, as long as the thread is not preempted BEFORE the fiber switch.
+        // This can cause a wrong thread to perform the fiber switch.
         if this.machine.threads.active_thread_ref().is_unwinding() {
             throw_unsup_format!(
                 "Thread {} requested a fiber switch while unwinding",
@@ -1004,26 +1026,34 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
                     .thread_display_name(this.machine.threads.active_thread())
             );
         }
-        let FiberSwitchRequest { fiber_id: target_fiber_id, exit } = request;
+        let FiberSwitchRequest { fiber_id: target_fiber_id, payload, payload_place } = request;
 
         let mut entry = this.find_fiber(target_fiber_id)?;
-        let mut fiber = check_fiber_is_vacant(&mut entry)?;
+        let SuspendedFiber { mut fiber, payload_place: target_payload_place } =
+            check_fiber_is_vacant(&mut entry)?;
+
+        // Write the payload into the target fiber's payload place.
+        this.write_scalar(payload, &target_payload_place)?;
 
         this.touch_fiber_race_token(&mut fiber)?;
 
+        // Swap the current fiber with the target fiber.
         let mut old_fiber =
             core::mem::replace(this.machine.threads.active_thread_mut().current_fiber_mut(), fiber);
 
         this.touch_fiber_race_token(&mut old_fiber)?;
 
-        if exit {
-            let old_slot = this.machine.threads.fibers.remove(&old_fiber.id);
-            this.machine.threads.fiber_id_allocator.dealloc(old_fiber.id);
-            assert!(matches!(old_slot, Some(None)));
-            this.drop_fiber(old_fiber)?;
-        } else {
-            let old_slot = this.machine.threads.fibers.insert(old_fiber.id, Some(old_fiber));
-            assert!(matches!(old_slot, Some(None)));
+        match payload_place {
+            Some(payload_place) => {
+                let old_fiber_id = old_fiber.id;
+                let suspended = SuspendedFiber { fiber: old_fiber, payload_place };
+                let old_slot = this.machine.threads.fibers.insert(old_fiber_id, Some(suspended));
+                assert!(matches!(old_slot, Some(None)));
+            }
+            None => {
+                this.machine.threads.fiber_id_allocator.dealloc(old_fiber.id);
+                this.drop_fiber(old_fiber)?;
+            }
         }
 
         interp_ok(SchedulingAction::ExecuteStep)
@@ -1215,14 +1245,17 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn handle_switch_to_fiber(
         &mut self,
         fiber_id: impl TryInto<u32> + Copy + std::fmt::Display,
-        exit: bool,
+        payload: Scalar,
+        dest: Option<&MPlaceTy<'tcx>>,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
-        let thread_manager = &mut this.machine.threads;
 
         let fiber_id = Self::to_fiber_id(fiber_id)?;
 
-        thread_manager.fiber_switch_request = Some(FiberSwitchRequest { fiber_id, exit });
+        let payload_place = dest.cloned();
+
+        this.machine.threads.fiber_switch_request =
+            Some(FiberSwitchRequest { fiber_id, payload, payload_place });
 
         interp_ok(())
     }
@@ -1246,13 +1279,33 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         let instance = this.get_ptr_fn(body)?.as_instance()?;
 
-        this.call_thread_root_function(instance, ExternAbi::Rust, &[func_arg], None, current_span)?;
+        let null_payload = ImmTy::from_scalar(
+            Scalar::from_maybe_pointer(Pointer::null(), this),
+            this.machine.layouts.mut_raw_ptr,
+        );
+
+        this.call_thread_root_function(
+            instance,
+            ExternAbi::Rust,
+            &[func_arg, null_payload],
+            None,
+            current_span,
+        )?;
+
+        // After pushing the frame, get the place for the payload argument (local _2).
+        // In MIR, _0 is return, _1 is first arg (data), _2 is second arg (payload).
+        // We need to force_allocation to ensure it's in memory so we can write to it later.
+        let payload_place_ty = this.local_to_place(mir::Local::from_u32(2))?;
+        let payload_place = this.force_allocation(&payload_place_ty)?;
 
         let fiber = core::mem::replace(
             this.machine.threads.active_thread_mut().current_fiber_mut(),
             current_fiber,
         );
-        this.machine.threads.fibers.insert(fiber_id, Some(fiber));
+
+        // Store the fiber as suspended with its payload place.
+        let suspended = SuspendedFiber { fiber, payload_place };
+        this.machine.threads.fibers.insert(fiber_id, Some(suspended));
 
         interp_ok(fiber_id)
     }
@@ -1264,8 +1317,8 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
         let fiber_id = Self::to_fiber_id(fiber_id)?;
         let mut entry = this.find_fiber(fiber_id)?;
-        let fiber = check_fiber_is_vacant(&mut entry)?;
-        entry.remove();
+        let SuspendedFiber { fiber, payload_place: _ } = check_fiber_is_vacant(&mut entry)?;
+        this.machine.threads.fiber_id_allocator.dealloc(fiber_id);
         this.drop_fiber(fiber)?;
         interp_ok(())
     }

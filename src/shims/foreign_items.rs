@@ -498,20 +498,26 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 this.write_scalar(Scalar::from_uint(id.to_u32(), dest.layout.size), dest)?;
             }
             "miri_fiber_switch" => {
-                let [id] = this.check_shim_sig(
-                    shim_sig!(extern "Rust" fn(usize) -> ()),
+                let [id, payload] = this.check_shim_sig(
+                    shim_sig!(extern "Rust" fn(usize, *mut _) -> *mut _),
                     link_name,
                     abi,
                     args,
                 )?;
                 let id = this.read_target_usize(id)?;
-                this.handle_switch_to_fiber(id, /* exit */ false)?;
+                let payload = this.read_scalar(payload)?;
+                // The dest is where the return value (incoming payload) will be written
+                // when this fiber is resumed.
+                this.handle_switch_to_fiber(id, payload, Some(dest))?;
             }
             "miri_fiber_exit_to" => {
                 // FIXME: shim_sig! doesn't support never type
-                let [id] = this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+                let [id, payload] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
                 let id = this.read_target_usize(id)?;
-                this.handle_switch_to_fiber(id, /* exit */ true)?;
+                let payload = this.read_scalar(payload)?;
+                // No dest since the current fiber is exiting.
+                this.handle_switch_to_fiber(id, payload, None)?;
                 return interp_ok(EmulateItemResult::AlreadyJumped);
             }
             "miri_fiber_destroy" => {

@@ -6,8 +6,8 @@ note: in Miri, you may have to set `MIRIFLAGS=-Zmiri-env-forward=RUST_BACKTRACE`
 error: unsupported operation: Thread main requested a fiber switch while unwinding
   --> tests/fail/panic/fiber_switch_in_unwind.rs:LL:CC
    |
-LL | ...   utils::miri_fiber_exit_to(PARENT_FIBER.load(Ordering::Relaxed));
-   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsupported operation occurred here
+LL | ...   utils::miri_fiber_exit_to(fiber, std::ptr::null_mut());
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unsupported operation occurred here
    |
    = help: this is likely not a bug in the program; it indicates that the program performed an operation that Miri does not support
    = note: stack backtrace:

@@ -23,33 +23,37 @@ impl<T: Default> Default for Context<T> {
 }
 
 impl<T> Context<T> {
-    unsafe fn setup(this: *mut Self, body: fn(*mut ()) -> !) {
+    unsafe fn setup(this: *mut Self, body: unsafe fn(*mut (), *mut u8) -> !) {
         unsafe {
             (*this).fiber = utils::miri_fiber_create(body, this as *mut _);
         }
     }
 
-    unsafe fn switch(this: *mut Self) {
+    unsafe fn switch(this: *mut Self, payload: *mut u8) -> *mut u8 {
         unsafe {
             let target = core::ptr::replace(&raw mut (*this).fiber, utils::miri_fiber_current());
-            utils::miri_fiber_switch(target);
+            utils::miri_fiber_switch(target, payload)
         }
     }
 
-    unsafe fn exit(this: *mut Self) -> ! {
-        unsafe { utils::miri_fiber_exit_to((*this).fiber) }
+    unsafe fn exit(this: *mut Self, payload: *mut u8) -> ! {
+        unsafe { utils::miri_fiber_exit_to((*this).fiber, payload) }
     }
 }
 
 fn execution_history() {
-    fn fiber_body(ctx: *mut ()) -> ! {
+    unsafe fn fiber_body(ctx: *mut (), payload: *mut u8) -> ! {
         let _guard = NoDrop;
         let ctx = ctx.cast::<Context<Vec<usize>>>();
         unsafe {
+            let value = payload.read();
+            drop(Box::from_raw(payload));
             (*ctx).aux.push(2);
-            Context::switch(ctx);
+            let payload = Context::switch(ctx, Box::into_raw(Box::new(value + 1)));
+            let value = payload.read();
+            drop(Box::from_raw(payload));
             (*ctx).aux.push(4);
-            Context::exit(ctx);
+            Context::exit(ctx, Box::into_raw(Box::new(value + 1)))
         }
     }
 
@@ -59,45 +63,53 @@ fn execution_history() {
     unsafe {
         Context::setup(ptr, fiber_body);
         (*ptr).aux.push(1);
-        Context::switch(ptr);
+        let payload = Context::switch(ptr, Box::into_raw(Box::new(0)));
+        *payload += 1;
         (*ptr).aux.push(3);
-        Context::switch(ptr);
+        let payload = Context::switch(ptr, payload);
         assert_eq!(ctx.aux, [0, 1, 2, 3, 4]);
+        assert_eq!(*payload, 3);
+        drop(Box::from_raw(payload));
     }
 }
 
 fn multiple_stack_reborrows() {
-    fn fiber_body(ctx: *mut ()) -> ! {
+    unsafe fn fiber_body(ctx: *mut (), payload: *mut u8) -> ! {
         let ctx1 = ctx;
+        let v = vec![1, 2, 3];
+        let payload = &mut *payload;
+        *payload += 1;
+        inner1(ctx1, v, payload);
 
-        fn inner1(ctx: *mut (), v: Vec<usize>) -> ! {
+        fn inner1(ctx: *mut (), v: Vec<usize>, payload: *mut u8) -> ! {
             let mut ctx2 = ctx;
             let v = v;
-            inner2(&mut ctx2, v);
+            inner2(&mut ctx2, v, payload);
 
-            fn inner2(ctx: &mut *mut (), v: Vec<usize>) -> ! {
+            fn inner2(ctx: &mut *mut (), v: Vec<usize>, payload: *mut u8) -> ! {
                 let ctx3 = ctx;
                 let v = v;
-                inner3(&*ctx3, &mut ManuallyDrop::new(v));
+                inner3(&*ctx3, &mut ManuallyDrop::new(v), payload);
 
-                fn inner3(ctx: &*mut (), v: &mut ManuallyDrop<Vec<usize>>) -> ! {
+                fn inner3(ctx: &*mut (), v: &mut ManuallyDrop<Vec<usize>>, payload: *mut u8) -> ! {
                     unsafe {
                         ManuallyDrop::drop(v);
-                        Context::exit(*ctx as *mut Context<()>)
+                        Context::exit(*ctx as *mut Context<()>, payload as *mut _)
                     }
                 }
             }
         }
-
-        let v = vec![1, 2, 3];
-        inner1(ctx1, v)
     }
 
     let mut ctx = Context::<()>::default();
     let ptr = &mut ctx as *mut _;
+    let mut storage = 0u8;
+    let payload = &mut storage as *mut _;
     unsafe {
         Context::setup(ptr, fiber_body);
-        Context::switch(ptr);
+        let ret = Context::switch(ptr, payload);
+        assert_eq!(ret, payload);
+        assert_eq!(storage, 1);
     }
 }
 

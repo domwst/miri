@@ -2,13 +2,14 @@
 mod utils;
 
 use std::hint::spin_loop;
+use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::scope;
 
 static PARENT_FIBER: AtomicUsize = AtomicUsize::new(0);
 
-fn fiber_body(_arg: *mut ()) -> ! {
-    unsafe { utils::miri_fiber_exit_to(PARENT_FIBER.load(Ordering::Relaxed)) }
+unsafe fn fiber_body(_arg: *mut (), _payload: *mut u8) -> ! {
+    unsafe { utils::miri_fiber_exit_to(PARENT_FIBER.load(Ordering::Relaxed), ptr::null_mut()) }
 }
 
 fn main() {
@@ -29,7 +30,7 @@ fn main() {
             s.spawn(|| {
                 PARENT_FIBER.store(utils::miri_fiber_current(), Ordering::Relaxed);
                 let f = fiber.load(Ordering::Relaxed);
-                utils::miri_fiber_switch(f); //~ ERROR: Undefined Behavior: Data race detected between (1) non-atomic write on thread `unnamed-1` and (2) non-atomic write on thread `unnamed-2` at alloc1819
+                utils::miri_fiber_switch(f, ptr::null_mut()); //~ ERROR: Undefined Behavior: Data race detected between (1) non-atomic write on thread `unnamed-1` and (2) non-atomic write on thread `unnamed-2` at alloc1820
             });
         });
     }

@@ -6,13 +6,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static PARENT_FIBER: AtomicUsize = AtomicUsize::new(0);
 
-fn fiber_body(_arg: *mut ()) -> ! {
+fn fiber_body(_arg: *mut (), _payload: *mut u8) -> ! {
     struct ExitOnDrop;
 
     impl Drop for ExitOnDrop {
         fn drop(&mut self) {
             unsafe {
-                utils::miri_fiber_exit_to(PARENT_FIBER.load(Ordering::Relaxed)); //~ERROR: unsupported operation: Thread main requested a fiber switch while unwinding
+                let fiber = PARENT_FIBER.load(Ordering::Relaxed);
+                utils::miri_fiber_exit_to(fiber, std::ptr::null_mut()); //~ ERROR: unsupported operation: Thread main requested a fiber switch while unwinding
             }
         }
     }
@@ -21,13 +22,13 @@ fn fiber_body(_arg: *mut ()) -> ! {
         let _guard = ExitOnDrop;
         panic!("unwind");
     });
-    unsafe { utils::miri_fiber_exit_to(PARENT_FIBER.load(Ordering::Relaxed)) }
+    unsafe { utils::miri_fiber_exit_to(PARENT_FIBER.load(Ordering::Relaxed), std::ptr::null_mut()) }
 }
 
 fn main() {
     unsafe {
         PARENT_FIBER.store(utils::miri_fiber_current(), Ordering::Relaxed);
         let fiber = utils::miri_fiber_create(fiber_body, core::ptr::null_mut());
-        utils::miri_fiber_switch(fiber);
+        utils::miri_fiber_switch(fiber, std::ptr::null_mut());
     }
 }
