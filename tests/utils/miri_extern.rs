@@ -187,4 +187,6 @@ extern "Rust" {
     /// `miri_fiber_switch` but indicates that the current fiber has exited
     /// and will never be switched to again.
     pub fn miri_fiber_exit_to(target: usize, payload: *mut u8) -> !;
+
+    pub fn miri_fiber_destroy(target: usize);
 }

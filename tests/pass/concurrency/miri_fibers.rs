@@ -113,7 +113,36 @@ fn multiple_stack_reborrows() {
     }
 }
 
+fn fiber_destroy() {
+    unsafe fn fiber_body(ctx: *mut (), _payload: *mut u8) -> ! {
+        let ctx = ctx.cast::<Context<()>>();
+        unsafe {
+            let _guard = NoDrop;
+            Context::switch(ctx, std::ptr::null_mut());
+            Context::exit(ctx, std::ptr::null_mut());
+        }
+    }
+
+    unsafe {
+        let mut ctx = Context::<()>::default();
+        let ptr = &mut ctx as *mut _;
+
+        Context::setup(ptr, fiber_body);
+        utils::miri_fiber_destroy((*ptr).fiber);
+    }
+
+    unsafe {
+        let mut ctx = Context::<()>::default();
+        let ptr = &mut ctx as *mut _;
+
+        Context::setup(ptr, fiber_body);
+        Context::switch(ptr, std::ptr::null_mut());
+        utils::miri_fiber_destroy((*ptr).fiber);
+    }
+}
+
 fn main() {
     execution_history();
     multiple_stack_reborrows();
+    fiber_destroy();
 }
