@@ -959,7 +959,9 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
 
         while let Some(frame) = fiber.stack.pop() {
-            this.on_stack_pop(&frame)?;
+            if this.machine.borrow_tracker.is_some() {
+                this.on_stack_pop(&frame)?;
+            }
             for local in frame.locals.iter() {
                 // https://github.com/rust-lang/rust/blob/26f3337d4eda0ba22b615744fda0185d0ee344b1/compiler/rustc_const_eval/src/interpret/stack.rs#L587
                 // https://github.com/rust-lang/rust/blob/26f3337d4eda0ba22b615744fda0185d0ee344b1/compiler/rustc_const_eval/src/interpret/stack.rs#L180
@@ -1070,6 +1072,11 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
     fn schedule(&mut self) -> InterpResult<'tcx, SchedulingAction> {
         let this = self.eval_context_mut();
 
+        // If a fiber switch is requested, perform it before anything else.
+        if let Some(request) = this.machine.threads.fiber_switch_request.take() {
+            return this.handle_fiber_switch(request);
+        }
+
         // In GenMC mode, we let GenMC do the scheduling.
         if this.machine.data_race.as_genmc_ref().is_some() {
             loop {
@@ -1099,11 +1106,6 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
         }
 
         // We are not in GenMC mode, so we control the scheduling.
-        // If a fiber switch is requested, perform it before anything else.
-        if let Some(request) = this.machine.threads.fiber_switch_request.take() {
-            return this.handle_fiber_switch(request);
-        }
-
         let thread_manager = &mut this.machine.threads;
         let clock = &this.machine.monotonic_clock;
         let rng = this.machine.rng.get_mut();
