@@ -1,5 +1,6 @@
 //! Implements threads.
 
+use std::collections::hash_map::{Entry, OccupiedEntry};
 use std::mem;
 use std::sync::atomic::Ordering::Relaxed;
 use std::task::Poll;
@@ -12,7 +13,7 @@ use rustc_data_structures::either::Either;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_index::{Idx, IndexVec};
-use rustc_middle::mir::Mutability;
+use rustc_middle::mir::{self, Mutability};
 use rustc_middle::ty::layout::TyAndLayout;
 use rustc_span::{DUMMY_SP, Span};
 use rustc_target::spec::Os;
@@ -164,19 +165,55 @@ enum ThreadJoinStatus {
     Joined,
 }
 
-/// A thread.
-pub struct Thread<'tcx> {
-    state: ThreadState<'tcx>,
+/// A fiber identifier.
+#[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq, Hash)]
+pub struct FiberId(u32);
 
-    /// Name of the thread.
-    thread_name: Option<Vec<u8>>,
+impl FiberId {
+    pub fn to_u32(self) -> u32 {
+        self.0
+    }
+
+    /// Create a new fiber id from a `u32` without checking if this fiber exists.
+    pub fn new_unchecked(id: u32) -> Self {
+        Self(id)
+    }
+
+    pub fn to_usize(self) -> usize {
+        usize::try_from(self.0).unwrap()
+    }
+}
+
+impl Idx for FiberId {
+    fn new(idx: usize) -> Self {
+        FiberId(u32::try_from(idx).unwrap())
+    }
+
+    fn index(self) -> usize {
+        self.to_usize()
+    }
+}
+
+impl From<FiberId> for u64 {
+    fn from(t: FiberId) -> Self {
+        t.0.into()
+    }
+}
+
+/// A fiber
+pub struct Fiber<'tcx> {
+    /// Id of the fiber.
+    pub(crate) id: FiberId,
+
+    /// `None` means the fiber was created by `miri_fiber_create`
+    /// and its body can't terminate normally.
+    /// `Some(origin)` means the fiber was created during creation
+    /// of the thread `thread_id` and it has to terminate on the
+    /// same thread.
+    pub(crate) origin_thread: Option<ThreadId>,
 
     /// The virtual call stack.
     stack: Vec<Frame<'tcx, Provenance, FrameExtra<'tcx>>>,
-
-    /// A span that explains where the thread (or more specifically, its current root
-    /// frame) "comes from".
-    pub(crate) origin_span: Span,
 
     /// The function to call when the stack ran empty, to figure out what to do next.
     /// Conceptually, this is the interpreter implementation of the things that happen 'after' the
@@ -190,46 +227,17 @@ pub struct Thread<'tcx> {
     /// maintained inside `MiriMachine::after_stack_push` and `MiriMachine::after_stack_pop`.
     top_user_relevant_frame: Option<usize>,
 
-    /// The join status.
-    join_status: ThreadJoinStatus,
+    /// A span that explains where the fiber (or more specifically, its current root
+    /// frame) "comes from".
+    pub(crate) origin_span: Span,
 
-    /// Stack of active unwind payloads for the current thread. Used for storing
-    /// the argument of the call to `miri_start_unwind` (the payload) when unwinding.
-    /// This is pointer-sized, and matches the `Payload` type in `src/libpanic_unwind/miri.rs`.
-    ///
-    /// In real unwinding, the payload gets passed as an argument to the landing pad,
-    /// which then forwards it to 'Resume'. However this argument is implicit in MIR,
-    /// so we have to store it out-of-band. When there are multiple active unwinds,
-    /// the innermost one is always caught first, so we can store them as a stack.
-    pub(crate) unwind_payloads: Vec<ImmTy<'tcx>>,
-
-    /// Last OS error location in memory. It is a 32-bit integer.
-    pub(crate) last_error: Option<MPlaceTy<'tcx>>,
+    /// Lazyly-allocated non-atomic memory location that is written to on every switch to and
+    /// from this fiber. Used to detect data races between previous switch from this fiber and
+    /// the next switch to this fiber.
+    pub(crate) race_token: Option<MPlaceTy<'tcx>>,
 }
 
-pub type StackEmptyCallback<'tcx> =
-    Box<dyn FnMut(&mut MiriInterpCx<'tcx>) -> InterpResult<'tcx, Poll<()>> + 'tcx>;
-
-impl<'tcx> Thread<'tcx> {
-    /// Get the name of the current thread if it was set.
-    fn thread_name(&self) -> Option<&[u8]> {
-        self.thread_name.as_deref()
-    }
-
-    /// Return whether this thread is enabled or not.
-    pub fn is_enabled(&self) -> bool {
-        self.state.is_enabled()
-    }
-
-    /// Get the name of the current thread for display purposes; will include thread ID if not set.
-    fn thread_display_name(&self, id: ThreadId) -> String {
-        if let Some(ref thread_name) = self.thread_name {
-            String::from_utf8_lossy(thread_name).into_owned()
-        } else {
-            format!("unnamed-{}", id.index())
-        }
-    }
-
+impl<'tcx> Fiber<'tcx> {
     /// Return the top user-relevant frame, if there is one. `skip` indicates how many top frames
     /// should be skipped.
     /// Note that the choice to return `None` here when there is no user-relevant frame is part of
@@ -287,6 +295,118 @@ impl<'tcx> Thread<'tcx> {
             .map(|frame_idx| self.stack[frame_idx].current_span())
             .unwrap_or(rustc_span::DUMMY_SP)
     }
+
+    fn new(
+        on_stack_empty: Option<StackEmptyCallback<'tcx>>,
+        id: FiberId,
+        origin: Option<ThreadId>,
+    ) -> Self {
+        Self {
+            id,
+            origin_thread: origin,
+            stack: Vec::new(),
+            origin_span: DUMMY_SP,
+            top_user_relevant_frame: None,
+            on_stack_empty,
+            race_token: None,
+        }
+    }
+}
+
+impl<'tcx> std::fmt::Debug for Fiber<'tcx> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "fiber_{}", self.id.to_u32())
+    }
+}
+
+impl VisitProvenance for Fiber<'_> {
+    fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
+        let Fiber {
+            id: _,
+            origin_thread: _,
+            stack,
+            origin_span: _,
+            top_user_relevant_frame: _,
+            on_stack_empty: _, // we assume the closure captures no GC-relevant state
+            race_token,
+        } = self;
+
+        for frame in stack {
+            frame.visit_provenance(visit);
+        }
+
+        race_token.visit_provenance(visit);
+    }
+}
+
+/// A thread.
+pub struct Thread<'tcx> {
+    state: ThreadState<'tcx>,
+
+    /// Name of the thread.
+    thread_name: Option<Vec<u8>>,
+
+    /// The fiber this thread currently runs
+    current_fiber: Fiber<'tcx>,
+
+    /// The join status.
+    join_status: ThreadJoinStatus,
+
+    /// Stack of active unwind payloads for the current thread. Used for storing
+    /// the argument of the call to `miri_start_unwind` (the payload) when unwinding.
+    /// This is pointer-sized, and matches the `Payload` type in `src/libpanic_unwind/miri.rs`.
+    ///
+    /// In real unwinding, the payload gets passed as an argument to the landing pad,
+    /// which then forwards it to 'Resume'. However this argument is implicit in MIR,
+    /// so we have to store it out-of-band. When there are multiple active unwinds,
+    /// the innermost one is always caught first, so we can store them as a stack.
+    ///
+    /// Currently Miri doesn't support switching stacks during unwinding, so this attribute
+    /// is per-thread racher than per-fiber.
+    pub(crate) unwind_payloads: Vec<ImmTy<'tcx>>,
+
+    /// Last OS error location in memory. It is a 32-bit integer.
+    pub(crate) last_error: Option<MPlaceTy<'tcx>>,
+}
+
+pub type StackEmptyCallback<'tcx> =
+    Box<dyn FnMut(&mut MiriInterpCx<'tcx>) -> InterpResult<'tcx, Poll<()>> + 'tcx>;
+
+impl<'tcx> Thread<'tcx> {
+    /// Get the name of the current thread if it was set.
+    fn thread_name(&self) -> Option<&[u8]> {
+        self.thread_name.as_deref()
+    }
+
+    /// Return whether this thread is enabled or not.
+    pub fn is_enabled(&self) -> bool {
+        self.state.is_enabled()
+    }
+
+    fn is_terminated(&self) -> bool {
+        self.state.is_terminated()
+    }
+
+    /// Get the name of the current thread for display purposes; will include thread ID if not set.
+    fn thread_display_name(&self, id: ThreadId) -> String {
+        if let Some(ref thread_name) = self.thread_name {
+            String::from_utf8_lossy(thread_name).into_owned()
+        } else {
+            format!("unnamed-{}", id.index())
+        }
+    }
+
+    pub fn current_fiber(&self) -> &Fiber<'tcx> {
+        &self.current_fiber
+    }
+
+    pub fn current_fiber_mut(&mut self) -> &mut Fiber<'tcx> {
+        &mut self.current_fiber
+    }
+
+    pub fn is_unwinding(&self) -> bool {
+        !self.unwind_payloads.is_empty()
+    }
 }
 
 impl<'tcx> std::fmt::Debug for Thread<'tcx> {
@@ -302,17 +422,14 @@ impl<'tcx> std::fmt::Debug for Thread<'tcx> {
 }
 
 impl<'tcx> Thread<'tcx> {
-    fn new(name: Option<&str>, on_stack_empty: Option<StackEmptyCallback<'tcx>>) -> Self {
+    fn new(name: Option<&str>, fiber: Fiber<'tcx>) -> Self {
         Self {
             state: ThreadState::Enabled,
             thread_name: name.map(|name| Vec::from(name.as_bytes())),
-            stack: Vec::new(),
-            origin_span: DUMMY_SP,
-            top_user_relevant_frame: None,
+            current_fiber: fiber,
             join_status: ThreadJoinStatus::Joinable,
             unwind_payloads: Vec::new(),
             last_error: None,
-            on_stack_empty,
         }
     }
 }
@@ -320,24 +437,20 @@ impl<'tcx> Thread<'tcx> {
 impl VisitProvenance for Thread<'_> {
     fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
         let Thread {
-            unwind_payloads: panic_payload,
+            current_fiber,
             last_error,
-            stack,
-            origin_span: _,
-            top_user_relevant_frame: _,
+            unwind_payloads: panic_payload,
             state: _,
             thread_name: _,
             join_status: _,
-            on_stack_empty: _, // we assume the closure captures no GC-relevant state
         } = self;
 
         for payload in panic_payload {
             payload.visit_provenance(visit);
         }
+
+        current_fiber.visit_provenance(visit);
         last_error.visit_provenance(visit);
-        for frame in stack {
-            frame.visit_provenance(visit)
-        }
     }
 }
 
@@ -421,9 +534,62 @@ pub enum TimeoutAnchor {
 #[derive(Debug, Copy, Clone)]
 pub struct ThreadNotFound;
 
+#[derive(Debug, Copy, Clone)]
+struct FiberIdAllocator {
+    next_id: u32,
+}
+
+impl FiberIdAllocator {
+    fn new(_seed: Option<u64>) -> Self {
+        Self { next_id: 0 }
+    }
+
+    fn alloc(&mut self) -> FiberId {
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).unwrap();
+        FiberId::new_unchecked(id)
+    }
+
+    fn dealloc(&mut self, _id: FiberId) {}
+}
+
+/// A suspended fiber, waiting to be resumed.
+/// Contains the fiber state and the memory location where the incoming payload
+/// should be written when the fiber is resumed.
+#[derive(Debug)]
+struct SuspendedFiber<'tcx> {
+    fiber: Fiber<'tcx>,
+    /// The memory location where the incoming payload will be written when this fiber is resumed.
+    /// For newly created fibers, this points to the payload argument of the body function.
+    /// For suspended fibers, this points to the return place of miri_fiber_switch.
+    payload_place: MPlaceTy<'tcx>,
+}
+
+impl VisitProvenance for SuspendedFiber<'_> {
+    fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
+        let SuspendedFiber { fiber, payload_place } = self;
+        fiber.visit_provenance(visit);
+        payload_place.visit_provenance(visit);
+    }
+}
+
+#[derive(Debug)]
+struct FiberSwitchRequest<'tcx> {
+    fiber_id: FiberId,
+    /// The payload to pass to the target fiber.
+    payload: Scalar,
+    /// The place where the current fiber will receive its payload when resumed.
+    /// This is the return place of miri_fiber_switch (or None for exit_to).
+    payload_place: Option<MPlaceTy<'tcx>>,
+}
+
 /// A set of threads.
 #[derive(Debug)]
 pub struct ThreadManager<'tcx> {
+    fiber_id_allocator: FiberIdAllocator,
+    /// All currently existing fibers.
+    fibers: FxHashMap<FiberId, Option<SuspendedFiber<'tcx>>>,
+
     /// Identifier of the currently active thread.
     active_thread: ThreadId,
     /// Threads used in the program.
@@ -432,6 +598,8 @@ pub struct ThreadManager<'tcx> {
     threads: IndexVec<ThreadId, Thread<'tcx>>,
     /// A mapping from a thread-local static to the thread specific allocation.
     thread_local_allocs: FxHashMap<(DefId, ThreadId), StrictPointer>,
+
+    fiber_switch_request: Option<FiberSwitchRequest<'tcx>>,
     /// A flag that indicates that we should change the active thread.
     /// Completely ignored in GenMC mode.
     yield_active_thread: bool,
@@ -442,15 +610,21 @@ pub struct ThreadManager<'tcx> {
 impl VisitProvenance for ThreadManager<'_> {
     fn visit_provenance(&self, visit: &mut VisitWith<'_>) {
         let ThreadManager {
+            fiber_id_allocator: _,
+            fibers,
             threads,
             thread_local_allocs,
             active_thread: _,
+            fiber_switch_request: _,
             yield_active_thread: _,
             fixed_scheduling: _,
         } = self;
 
         for thread in threads {
             thread.visit_provenance(visit);
+        }
+        for suspended in fibers.values() {
+            suspended.visit_provenance(visit);
         }
         for ptr in thread_local_allocs.values() {
             ptr.visit_provenance(visit);
@@ -461,12 +635,20 @@ impl VisitProvenance for ThreadManager<'_> {
 impl<'tcx> ThreadManager<'tcx> {
     pub(crate) fn new(config: &MiriConfig) -> Self {
         let mut threads = IndexVec::new();
+        let mut fibers = FxHashMap::default();
+        let mut fiber_id_allocator = FiberIdAllocator::new(config.seed);
         // Create the main thread and add it to the list of threads.
-        threads.push(Thread::new(Some("main"), None));
+        let main_fiber_id = fiber_id_allocator.alloc();
+        let main_fiber = Fiber::new(None, main_fiber_id, Some(ThreadId::MAIN_THREAD));
+        threads.push(Thread::new(Some("main"), main_fiber));
+        fibers.insert(main_fiber_id, None);
         Self {
+            fiber_id_allocator,
+            fibers,
             active_thread: ThreadId::MAIN_THREAD,
             threads,
             thread_local_allocs: Default::default(),
+            fiber_switch_request: None,
             yield_active_thread: false,
             fixed_scheduling: config.fixed_scheduling,
         }
@@ -476,7 +658,7 @@ impl<'tcx> ThreadManager<'tcx> {
         ecx: &mut MiriInterpCx<'tcx>,
         on_main_stack_empty: StackEmptyCallback<'tcx>,
     ) {
-        ecx.machine.threads.threads[ThreadId::MAIN_THREAD].on_stack_empty =
+        ecx.machine.threads.threads[ThreadId::MAIN_THREAD].current_fiber.on_stack_empty =
             Some(on_main_stack_empty);
         if ecx.tcx.sess.target.os != Os::Windows {
             // The main thread can *not* be joined on except on windows.
@@ -511,14 +693,14 @@ impl<'tcx> ThreadManager<'tcx> {
 
     /// Borrow the stack of the active thread.
     pub fn active_thread_stack(&self) -> &[Frame<'tcx, Provenance, FrameExtra<'tcx>>] {
-        &self.threads[self.active_thread].stack
+        &self.threads[self.active_thread].current_fiber.stack
     }
 
     /// Mutably borrow the stack of the active thread.
     pub fn active_thread_stack_mut(
         &mut self,
     ) -> &mut Vec<Frame<'tcx, Provenance, FrameExtra<'tcx>>> {
-        &mut self.threads[self.active_thread].stack
+        &mut self.threads[self.active_thread].current_fiber.stack
     }
 
     pub fn all_blocked_stacks(
@@ -527,13 +709,16 @@ impl<'tcx> ThreadManager<'tcx> {
         self.threads
             .iter_enumerated()
             .filter(|(_id, t)| matches!(t.state, ThreadState::Blocked { .. }))
-            .map(|(id, t)| (id, &t.stack[..]))
+            .map(|(id, t)| (id, &t.current_fiber.stack[..]))
     }
 
     /// Create a new thread and returns its id.
     fn create_thread(&mut self, on_stack_empty: StackEmptyCallback<'tcx>) -> ThreadId {
         let new_thread_id = ThreadId::new(self.threads.len());
-        self.threads.push(Thread::new(None, Some(on_stack_empty)));
+        let new_fiber_id = self.fiber_id_allocator.alloc();
+        let new_fiber = Fiber::new(Some(on_stack_empty), new_fiber_id, Some(new_thread_id));
+        self.threads.push(Thread::new(None, new_fiber));
+        self.fibers.insert(new_fiber_id, None);
         new_thread_id
     }
 
@@ -561,17 +746,17 @@ impl<'tcx> ThreadManager<'tcx> {
     /// Get the total of threads that are currently live, i.e., not yet terminated.
     /// (They might be blocked.)
     pub fn get_live_thread_count(&self) -> usize {
-        self.threads.iter().filter(|t| !t.state.is_terminated()).count()
+        self.threads.iter().filter(|t| !t.is_terminated()).count()
     }
 
     /// Has the given thread terminated?
     fn has_terminated(&self, thread_id: ThreadId) -> bool {
-        self.threads[thread_id].state.is_terminated()
+        self.threads[thread_id].is_terminated()
     }
 
     /// Have all threads terminated?
     fn have_all_terminated(&self) -> bool {
-        self.threads.iter().all(|thread| thread.state.is_terminated())
+        self.threads.iter().all(|thread| thread.is_terminated())
     }
 
     /// Enable the thread for execution. The thread must be terminated.
@@ -606,7 +791,7 @@ impl<'tcx> ThreadManager<'tcx> {
         // NOTE: In GenMC mode, we treat detached threads like regular threads that are never joined, so there is no special handling required here.
         trace!("detaching {:?}", id);
 
-        let is_ub = if allow_terminated_joined && self.threads[id].state.is_terminated() {
+        let is_ub = if allow_terminated_joined && self.threads[id].is_terminated() {
             // "Detached" in particular means "not yet joined". Redundant detaching is still UB.
             self.threads[id].join_status == ThreadJoinStatus::Detached
         } else {
@@ -669,6 +854,18 @@ impl<'tcx> ThreadManager<'tcx> {
     }
 }
 
+fn check_fiber_is_vacant<'tcx>(
+    entry: &mut OccupiedEntry<'_, FiberId, Option<SuspendedFiber<'tcx>>>,
+) -> InterpResult<'tcx, SuspendedFiber<'tcx>> {
+    match entry.get_mut().take() {
+        Some(fiber) => interp_ok(fiber),
+        None => {
+            let fiber_id = entry.key();
+            throw_ub_format!("target fiber {} is currently executing", fiber_id.to_u32())
+        }
+    }
+}
+
 impl<'tcx> EvalContextPrivExt<'tcx> for MiriInterpCx<'tcx> {}
 trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
     /// Execute a timeout callback on the callback's thread.
@@ -712,17 +909,175 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
     }
 
     #[inline]
+    fn check_current_fiber_origin(&self) -> InterpResult<'tcx> {
+        let this = self.eval_context_ref();
+        let active_thread = this.active_thread();
+        let fiber = this.active_fiber_ref();
+        match fiber.origin_thread {
+            None => {
+                // Fiber was created by `miri_fiber_create`.
+                throw_ub_format!(
+                    "body of the fiber {} has terminated normally on the thread {}",
+                    fiber.id.to_u32(),
+                    active_thread.to_u32()
+                );
+            }
+            Some(origin) if origin != active_thread => {
+                throw_ub_format!(
+                    "body of the fiber {} has terminated on the thread {}, but it was created as the body of thread {}",
+                    fiber.id.to_u32(),
+                    active_thread.to_u32(),
+                    origin.to_u32()
+                );
+            }
+            _ => interp_ok(()),
+        }
+    }
+
+    #[inline]
     fn run_on_stack_empty(&mut self) -> InterpResult<'tcx, Poll<()>> {
         let this = self.eval_context_mut();
+
+        // Check fiber origin before resetting origin span
+        this.check_current_fiber_origin()?;
+
         let active_thread = this.active_thread_mut();
-        active_thread.origin_span = DUMMY_SP; // reset, the old value no longer applied
+        active_thread.current_fiber.origin_span = DUMMY_SP; // reset, the old value no longer applied
         let mut callback = active_thread
+            .current_fiber
             .on_stack_empty
             .take()
             .expect("`on_stack_empty` not set up, or already running");
         let res = callback(this)?;
-        this.active_thread_mut().on_stack_empty = Some(callback);
+        this.active_thread_mut().current_fiber.on_stack_empty = Some(callback);
         interp_ok(res)
+    }
+
+    /// Drops a fiber deallocating all stack allocations to prevent
+    /// leak reports. This does *not* run Drop's of the local variables.
+    fn drop_fiber(&mut self, mut fiber: Fiber<'tcx>) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+
+        while let Some(frame) = fiber.stack.pop() {
+            for (idx, local_state) in frame.locals.iter_enumerated() {
+                let Some(state) = local_state.as_mplace_or_imm() else {
+                    continue;
+                };
+                if matches!(state, Either::Left(_) | Either::Right(Immediate::Uninit)) {
+                    continue;
+                }
+                let ty = &frame.body().local_decls[idx].ty;
+                if ty.needs_drop(this.machine.tcx, this.machine.tenv) {
+                    throw_ub_format!(
+                        "dropping fiber {} while it has local variable of type {} requiring `Drop` (frame = {}, idx = {})",
+                        fiber.id.to_u32(),
+                        ty,
+                        fiber.stack.len(),
+                        idx.as_usize()
+                    );
+                }
+            }
+
+            if this.machine.borrow_tracker.is_some() {
+                this.on_stack_pop(&frame)?;
+            }
+            for local in frame.locals.iter() {
+                // https://github.com/rust-lang/rust/blob/26f3337d4eda0ba22b615744fda0185d0ee344b1/compiler/rustc_const_eval/src/interpret/stack.rs#L587
+                // https://github.com/rust-lang/rust/blob/26f3337d4eda0ba22b615744fda0185d0ee344b1/compiler/rustc_const_eval/src/interpret/stack.rs#L180
+
+                let Some(local) = local.as_mplace_or_imm() else {
+                    continue;
+                };
+                let Either::Left((ptr, _meta)) = local else {
+                    continue;
+                };
+                this.deallocate_ptr(ptr, None, MemoryKind::Stack)?;
+            }
+        }
+
+        drop(fiber);
+
+        interp_ok(())
+    }
+
+    fn touch_fiber_race_token(&mut self, fiber: &mut Fiber<'tcx>) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        let race_token = match fiber.race_token {
+            Some(ref mut race_token) => race_token,
+            None => {
+                let race_token =
+                    this.allocate(this.machine.layouts.u8, MiriMemoryKind::Machine.into())?;
+                fiber.race_token.insert(race_token)
+            }
+        };
+        this.write_scalar(Scalar::from_u8(0), race_token)?;
+
+        interp_ok(())
+    }
+
+    fn find_fiber(
+        &mut self,
+        fiber_id: FiberId,
+    ) -> InterpResult<'tcx, OccupiedEntry<'_, FiberId, Option<SuspendedFiber<'tcx>>>> {
+        let this = self.eval_context_mut();
+        let thread_manager = &mut this.machine.threads;
+        match thread_manager.fibers.entry(fiber_id) {
+            Entry::Occupied(entry) => interp_ok(entry),
+            Entry::Vacant(_) => {
+                throw_ub_format!("target fiber {} doesn't exist", fiber_id.to_u32())
+            }
+        }
+    }
+
+    fn handle_fiber_switch(
+        &mut self,
+        request: FiberSwitchRequest<'tcx>,
+    ) -> InterpResult<'tcx, SchedulingAction> {
+        let this = self.eval_context_mut();
+
+        // By this point the thread might have requested yield (i.e. due to preemtion),
+        // that's ok, as long as the thread is not preempted BEFORE the fiber switch.
+        // This can cause a wrong thread to perform the fiber switch.
+        if this.machine.threads.active_thread_ref().is_unwinding() {
+            throw_unsup_format!(
+                "Thread {} requested a fiber switch while unwinding",
+                this.machine
+                    .threads
+                    .active_thread_ref()
+                    .thread_display_name(this.machine.threads.active_thread())
+            );
+        }
+        let FiberSwitchRequest { fiber_id: target_fiber_id, payload, payload_place } = request;
+
+        let mut entry = this.find_fiber(target_fiber_id)?;
+        let SuspendedFiber { mut fiber, payload_place: target_payload_place } =
+            check_fiber_is_vacant(&mut entry)?;
+
+        // Write the payload into the target fiber's payload place.
+        this.write_scalar(payload, &target_payload_place)?;
+
+        this.touch_fiber_race_token(&mut fiber)?;
+
+        // Swap the current fiber with the target fiber.
+        let mut old_fiber =
+            core::mem::replace(this.machine.threads.active_thread_mut().current_fiber_mut(), fiber);
+
+        this.touch_fiber_race_token(&mut old_fiber)?;
+
+        match payload_place {
+            Some(payload_place) => {
+                let old_fiber_id = old_fiber.id;
+                let suspended = SuspendedFiber { fiber: old_fiber, payload_place };
+                let old_slot = this.machine.threads.fibers.insert(old_fiber_id, Some(suspended));
+                assert!(matches!(old_slot, Some(None)));
+            }
+            None => {
+                this.machine.threads.fiber_id_allocator.dealloc(old_fiber.id);
+                this.drop_fiber(old_fiber)?;
+            }
+        }
+
+        interp_ok(SchedulingAction::ExecuteStep)
     }
 
     /// Decide which action to take next and on which thread.
@@ -735,6 +1090,11 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
     /// If GenMC mode is active, the scheduling is instead handled by GenMC.
     fn schedule(&mut self) -> InterpResult<'tcx, SchedulingAction> {
         let this = self.eval_context_mut();
+
+        // If a fiber switch is requested, perform it before anything else.
+        if let Some(request) = this.machine.threads.fiber_switch_request.take() {
+            return this.handle_fiber_switch(request);
+        }
 
         // In GenMC mode, we let GenMC do the scheduling.
         if this.machine.data_race.as_genmc_ref().is_some() {
@@ -769,12 +1129,13 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
         let clock = &this.machine.monotonic_clock;
         let rng = this.machine.rng.get_mut();
         // This thread and the program can keep going.
-        if thread_manager.threads[thread_manager.active_thread].state.is_enabled()
+        if thread_manager.active_thread_ref().state.is_enabled()
             && !thread_manager.yield_active_thread
         {
             // The currently active thread is still enabled, just continue with it.
             return interp_ok(SchedulingAction::ExecuteStep);
         }
+
         // The active thread yielded or got terminated. Let's see if there are any timeouts to take
         // care of. We do this *before* running any other thread, to ensure that timeouts "in the
         // past" fire before any other thread can take an action. This ensures that for
@@ -826,7 +1187,7 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
             return interp_ok(SchedulingAction::ExecuteStep);
         }
         // We have not found a thread to execute.
-        if thread_manager.threads.iter().all(|thread| thread.state.is_terminated()) {
+        if thread_manager.threads.iter().all(|thread| thread.is_terminated()) {
             unreachable!("all threads terminated without the main thread terminating?!");
         } else if let Some(sleep_time) = potential_sleep_time {
             // All threads are currently blocked, but we have unexecuted
@@ -887,6 +1248,100 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
             this.machine.threads.set_thread_local_alloc(def_id, ptr);
             interp_ok(ptr)
         }
+    }
+
+    fn to_fiber_id(
+        fiber_id: impl TryInto<u32> + Copy + std::fmt::Display,
+    ) -> InterpResult<'tcx, FiberId> {
+        match fiber_id.try_into() {
+            Ok(v) => interp_ok(FiberId::new_unchecked(v)),
+            Err(_) => {
+                throw_machine_stop!(TerminationInfo::Abort(format!(
+                    "fiber {fiber_id} doesn't exist",
+                )))
+            }
+        }
+    }
+
+    fn handle_switch_to_fiber(
+        &mut self,
+        fiber_id: impl TryInto<u32> + Copy + std::fmt::Display,
+        payload: Scalar,
+        dest: Option<&MPlaceTy<'tcx>>,
+    ) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+
+        let fiber_id = Self::to_fiber_id(fiber_id)?;
+
+        let payload_place = dest.cloned();
+
+        this.machine.threads.fiber_switch_request =
+            Some(FiberSwitchRequest { fiber_id, payload, payload_place });
+
+        interp_ok(())
+    }
+
+    fn handle_create_fiber(
+        &mut self,
+        body: Pointer,
+        func_arg: ImmTy<'tcx>,
+    ) -> InterpResult<'tcx, FiberId> {
+        let this = self.eval_context_mut();
+
+        let fiber_id = this.machine.threads.fiber_id_allocator.alloc();
+
+        let current_span = this.machine.current_user_relevant_span();
+        let mut fiber = Fiber::new(None, fiber_id, None);
+
+        this.touch_fiber_race_token(&mut fiber)?;
+
+        let current_fiber =
+            core::mem::replace(this.machine.threads.active_thread_mut().current_fiber_mut(), fiber);
+
+        let instance = this.get_ptr_fn(body)?.as_instance()?;
+
+        let null_payload = ImmTy::from_scalar(
+            Scalar::from_maybe_pointer(Pointer::null(), this),
+            this.machine.layouts.mut_raw_ptr,
+        );
+
+        this.call_thread_root_function(
+            instance,
+            ExternAbi::Rust,
+            &[func_arg, null_payload],
+            None,
+            current_span,
+        )?;
+
+        // After pushing the frame, get the place for the payload argument (local _2).
+        // In MIR, _0 is return, _1 is first arg (data), _2 is second arg (payload).
+        // We need to force_allocation to ensure it's in memory so we can write to it later.
+        let payload_place_ty = this.local_to_place(mir::Local::from_u32(2))?;
+        let payload_place = this.force_allocation(&payload_place_ty)?;
+
+        let fiber = core::mem::replace(
+            this.machine.threads.active_thread_mut().current_fiber_mut(),
+            current_fiber,
+        );
+
+        // Store the fiber as suspended with its payload place.
+        let suspended = SuspendedFiber { fiber, payload_place };
+        this.machine.threads.fibers.insert(fiber_id, Some(suspended));
+
+        interp_ok(fiber_id)
+    }
+
+    fn handle_destroy_fiber(
+        &mut self,
+        fiber_id: impl TryInto<u32> + Copy + std::fmt::Display,
+    ) -> InterpResult<'tcx> {
+        let this = self.eval_context_mut();
+        let fiber_id = Self::to_fiber_id(fiber_id)?;
+        let mut entry = this.find_fiber(fiber_id)?;
+        let SuspendedFiber { fiber, payload_place: _ } = check_fiber_is_vacant(&mut entry)?;
+        this.machine.threads.fiber_id_allocator.dealloc(fiber_id);
+        this.drop_fiber(fiber)?;
+        interp_ok(())
     }
 
     /// Start a regular (non-main) thread.
@@ -968,7 +1423,10 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
 
         // Mark thread as terminated.
         let thread = this.active_thread_mut();
-        assert!(thread.stack.is_empty(), "only threads with an empty stack can be terminated");
+        assert!(
+            thread.current_fiber.stack.is_empty(),
+            "only threads with an empty stack can be terminated"
+        );
         thread.state = ThreadState::Terminated;
 
         // Deallocate TLS.
@@ -1134,7 +1592,7 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
         // Mark the joined thread as being joined so that we detect if other
         // threads try to join it.
         thread_mgr.threads[joined_thread_id].join_status = ThreadJoinStatus::Joined;
-        if !thread_mgr.threads[joined_thread_id].state.is_terminated() {
+        if !thread_mgr.threads[joined_thread_id].is_terminated() {
             trace!(
                 "{:?} blocked on {:?} when trying to join",
                 thread_mgr.active_thread, joined_thread_id
@@ -1215,6 +1673,18 @@ pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn active_thread_ref(&self) -> &Thread<'tcx> {
         let this = self.eval_context_ref();
         this.machine.threads.active_thread_ref()
+    }
+
+    #[inline]
+    fn active_fiber_ref(&self) -> &Fiber<'tcx> {
+        let this = self.eval_context_ref();
+        this.machine.threads.active_thread_ref().current_fiber()
+    }
+
+    #[inline]
+    fn active_fiber_mut(&mut self) -> &mut Fiber<'tcx> {
+        let this = self.eval_context_mut();
+        this.machine.threads.active_thread_mut().current_fiber_mut()
     }
 
     #[inline]

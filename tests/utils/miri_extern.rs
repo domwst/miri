@@ -171,4 +171,22 @@ extern "Rust" {
     ///
     /// As far as Miri is concerned, this is equivalent to `yield_now`.
     pub fn miri_spin_loop();
+
+    pub fn miri_fiber_create(
+        body: unsafe extern "Rust" fn(*mut (), *mut u8) -> !,
+        data: *mut (),
+    ) -> usize;
+
+    pub fn miri_fiber_current() -> usize;
+
+    /// Switch to the target fiber, passing the given payload.
+    /// Returns the payload passed back by the fiber that switched to us.
+    pub fn miri_fiber_switch(target: usize, payload: *mut u8) -> *mut u8;
+
+    /// Exit the current fiber to the fiber with the given ID. Acts as
+    /// `miri_fiber_switch` but indicates that the current fiber has exited
+    /// and will never be switched to again.
+    pub fn miri_fiber_exit_to(target: usize, payload: *mut u8) -> !;
+
+    pub fn miri_fiber_destroy(target: usize);
 }

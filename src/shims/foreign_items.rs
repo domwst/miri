@@ -476,6 +476,60 @@ trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
                 // Try to run another thread to maximize the chance of finding actual bugs.
                 this.yield_active_thread();
             }
+            "miri_fiber_create" => {
+                // FIXME: `check_shim_sig` does not work with function pointers.
+                let [body, data] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+                let start_routine = this.read_pointer(body)?;
+                let func_arg = this.read_immediate(data)?;
+
+                let id = this.handle_create_fiber(start_routine, func_arg)?;
+                this.write_scalar(Scalar::from_uint(id.to_u32(), dest.layout.size), dest)?;
+            }
+            "miri_fiber_current" => {
+                let [] = this.check_shim_sig(
+                    shim_sig!(extern "Rust" fn() -> usize),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+
+                let id = this.active_fiber_ref().id;
+                this.write_scalar(Scalar::from_uint(id.to_u32(), dest.layout.size), dest)?;
+            }
+            "miri_fiber_switch" => {
+                let [id, payload] = this.check_shim_sig(
+                    shim_sig!(extern "Rust" fn(usize, *mut _) -> *mut _),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let id = this.read_target_usize(id)?;
+                let payload = this.read_scalar(payload)?;
+                // The dest is where the return value (incoming payload) will be written
+                // when this fiber is resumed.
+                this.handle_switch_to_fiber(id, payload, Some(dest))?;
+            }
+            "miri_fiber_exit_to" => {
+                // FIXME: shim_sig! doesn't support never type
+                let [id, payload] =
+                    this.check_shim_sig_lenient(abi, CanonAbi::Rust, link_name, args)?;
+                let id = this.read_target_usize(id)?;
+                let payload = this.read_scalar(payload)?;
+                // No dest since the current fiber is exiting.
+                this.handle_switch_to_fiber(id, payload, None)?;
+                return interp_ok(EmulateItemResult::AlreadyJumped);
+            }
+            "miri_fiber_destroy" => {
+                let [id] = this.check_shim_sig(
+                    shim_sig!(extern "Rust" fn(usize) -> ()),
+                    link_name,
+                    abi,
+                    args,
+                )?;
+                let id = this.read_target_usize(id)?;
+                this.handle_destroy_fiber(id)?;
+            }
             // Obtains the size of a Miri backtrace. See the README for details.
             "miri_backtrace_size" => {
                 this.handle_miri_backtrace_size(abi, link_name, args, dest)?;

@@ -25,7 +25,7 @@ use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::layout::{
     HasTyCtxt, HasTypingEnv, LayoutCx, LayoutError, LayoutOf, TyAndLayout,
 };
-use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
+use rustc_middle::ty::{self, Instance, Ty, TyCtxt, TypingEnv};
 use rustc_session::config::InliningThreshold;
 use rustc_span::def_id::{CrateNum, DefId};
 use rustc_span::{Span, SpanData, Symbol};
@@ -484,6 +484,7 @@ impl<'tcx> PrimitiveLayouts<'tcx> {
 pub struct MiriMachine<'tcx> {
     // We carry a copy of the global `TyCtxt` for convenience, so methods taking just `&Evaluator` have `tcx` access.
     pub tcx: TyCtxt<'tcx>,
+    pub tenv: TypingEnv<'tcx>,
 
     /// Global data for borrow tracking.
     pub borrow_tracker: Option<borrow_tracker::GlobalState>,
@@ -668,6 +669,7 @@ impl<'tcx> MiriMachine<'tcx> {
         genmc_ctx: Option<Rc<GenmcCtx>>,
     ) -> Self {
         let tcx = layout_cx.tcx();
+        let tenv = layout_cx.typing_env();
         let user_relevant_crates = Self::get_user_relevant_crates(tcx, config);
         let layouts =
             PrimitiveLayouts::new(layout_cx).expect("Couldn't get layouts of primitive types");
@@ -735,6 +737,7 @@ impl<'tcx> MiriMachine<'tcx> {
             RefCell::new(alloc_addresses::GlobalStateInner::new(config, stack_addr, tcx));
         MiriMachine {
             tcx,
+            tenv,
             borrow_tracker,
             data_race,
             alloc_addresses,
@@ -1011,6 +1014,7 @@ impl VisitProvenance for MiriMachine<'_> {
             fds,
             epoll_interests:_,
             tcx: _,
+            tenv: _,
             isolated_op: _,
             validation: _,
             monotonic_clock: _,
@@ -1773,11 +1777,11 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
 
     #[inline(always)]
     fn after_stack_push(ecx: &mut InterpCx<'tcx, Self>) -> InterpResult<'tcx> {
-        if ecx.frame().extra.user_relevance >= ecx.active_thread_ref().current_user_relevance() {
+        if ecx.frame().extra.user_relevance >= ecx.active_fiber_ref().current_user_relevance() {
             // We just pushed a frame that's at least as relevant as the so-far most relevant frame.
             // That means we are now the most relevant frame.
             let stack_len = ecx.active_thread_stack().len();
-            ecx.active_thread_mut().set_top_user_relevant_frame(stack_len - 1);
+            ecx.active_fiber_mut().set_top_user_relevant_frame(stack_len - 1);
         }
         interp_ok(())
     }
@@ -1790,7 +1794,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
             ecx.on_stack_pop(frame)?;
         }
         if ecx
-            .active_thread_ref()
+            .active_fiber_ref()
             .top_user_relevant_frame()
             .expect("there should always be a most relevant frame for a non-empty stack")
             == ecx.frame_idx()
@@ -1800,7 +1804,7 @@ impl<'tcx> Machine<'tcx> for MiriMachine<'tcx> {
             // (If this ever becomes a bottleneck, we could have `push` store the previous
             // user-relevant frame and restore that here.)
             // We have to skip the frame that is just being popped.
-            ecx.active_thread_mut().recompute_top_user_relevant_frame(/* skip */ 1);
+            ecx.active_fiber_mut().recompute_top_user_relevant_frame(/* skip */ 1);
         }
         // tracing-tree can autoamtically annotate scope changes, but it gets very confused by our
         // concurrency and what it prints is just plain wrong. So we print our own information
