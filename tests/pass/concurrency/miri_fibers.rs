@@ -3,11 +3,15 @@ mod utils;
 
 use std::mem::ManuallyDrop;
 
-struct NoDrop;
+static mut DROPPED: u8 = 0;
 
-impl Drop for NoDrop {
+struct HasDrop;
+
+impl Drop for HasDrop {
     fn drop(&mut self) {
-        panic!("NoDrop should not be dropped");
+        unsafe {
+            DROPPED += 1;
+        }
     }
 }
 
@@ -43,7 +47,9 @@ impl<T> Context<T> {
 
 fn execution_history() {
     unsafe fn fiber_body(ctx: *mut (), payload: *mut u8) -> ! {
-        let _guard = NoDrop;
+        {
+            let _guard = HasDrop;
+        }
         let ctx = ctx.cast::<Context<Vec<usize>>>();
         unsafe {
             let value = payload.read();
@@ -57,6 +63,7 @@ fn execution_history() {
         }
     }
 
+    let dropped_before = unsafe { DROPPED };
     let mut ctx = Context::<Vec<usize>>::default();
     ctx.aux.push(0);
     let ptr = &mut ctx as *mut Context<Vec<usize>>;
@@ -69,6 +76,7 @@ fn execution_history() {
         let payload = Context::switch(ptr, payload);
         assert_eq!(ctx.aux, [0, 1, 2, 3, 4]);
         assert_eq!(*payload, 3);
+        assert_eq!(DROPPED - dropped_before, 1);
         drop(Box::from_raw(payload));
     }
 }
@@ -84,7 +92,8 @@ fn multiple_stack_reborrows() {
         fn inner1(ctx: *mut (), v: Vec<usize>, payload: *mut u8) -> ! {
             let mut ctx2 = ctx;
             let v = v;
-            inner2(&mut ctx2, v, payload);
+            drop(v);
+            inner2(&mut ctx2, vec![4, 5, 6], payload);
 
             fn inner2(ctx: &mut *mut (), v: Vec<usize>, payload: *mut u8) -> ! {
                 let ctx3 = ctx;
@@ -117,27 +126,33 @@ fn fiber_destroy() {
     unsafe fn fiber_body(ctx: *mut (), _payload: *mut u8) -> ! {
         let ctx = ctx.cast::<Context<()>>();
         unsafe {
-            let _guard = NoDrop;
+            {
+                let _guard = HasDrop;
+            }
             Context::switch(ctx, std::ptr::null_mut());
             Context::exit(ctx, std::ptr::null_mut());
         }
     }
 
     unsafe {
+        let dropped_before = DROPPED;
         let mut ctx = Context::<()>::default();
         let ptr = &mut ctx as *mut _;
 
         Context::setup(ptr, fiber_body);
         utils::miri_fiber_destroy((*ptr).fiber);
+        assert_eq!(DROPPED - dropped_before, 0);
     }
 
     unsafe {
+        let dropped_before = DROPPED;
         let mut ctx = Context::<()>::default();
         let ptr = &mut ctx as *mut _;
 
         Context::setup(ptr, fiber_body);
         Context::switch(ptr, std::ptr::null_mut());
         utils::miri_fiber_destroy((*ptr).fiber);
+        assert_eq!(DROPPED - dropped_before, 1);
     }
 }
 

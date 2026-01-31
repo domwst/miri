@@ -959,6 +959,25 @@ trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
         let this = self.eval_context_mut();
 
         while let Some(frame) = fiber.stack.pop() {
+            for (idx, local_state) in frame.locals.iter_enumerated() {
+                let Some(state) = local_state.as_mplace_or_imm() else {
+                    continue;
+                };
+                if matches!(state, Either::Left(_) | Either::Right(Immediate::Uninit)) {
+                    continue;
+                }
+                let ty = &frame.body().local_decls[idx].ty;
+                if ty.needs_drop(this.machine.tcx, this.machine.tenv) {
+                    throw_ub_format!(
+                        "dropping fiber {} while it has local variable of type {} requiring `Drop` (frame = {}, idx = {})",
+                        fiber.id.to_u32(),
+                        ty,
+                        fiber.stack.len(),
+                        idx.as_usize()
+                    );
+                }
+            }
+
             if this.machine.borrow_tracker.is_some() {
                 this.on_stack_pop(&frame)?;
             }

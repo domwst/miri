@@ -25,7 +25,7 @@ use rustc_middle::query::TyCtxtAt;
 use rustc_middle::ty::layout::{
     HasTyCtxt, HasTypingEnv, LayoutCx, LayoutError, LayoutOf, TyAndLayout,
 };
-use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
+use rustc_middle::ty::{self, Instance, Ty, TyCtxt, TypingEnv};
 use rustc_session::config::InliningThreshold;
 use rustc_span::def_id::{CrateNum, DefId};
 use rustc_span::{Span, SpanData, Symbol};
@@ -484,6 +484,7 @@ impl<'tcx> PrimitiveLayouts<'tcx> {
 pub struct MiriMachine<'tcx> {
     // We carry a copy of the global `TyCtxt` for convenience, so methods taking just `&Evaluator` have `tcx` access.
     pub tcx: TyCtxt<'tcx>,
+    pub tenv: TypingEnv<'tcx>,
 
     /// Global data for borrow tracking.
     pub borrow_tracker: Option<borrow_tracker::GlobalState>,
@@ -668,6 +669,7 @@ impl<'tcx> MiriMachine<'tcx> {
         genmc_ctx: Option<Rc<GenmcCtx>>,
     ) -> Self {
         let tcx = layout_cx.tcx();
+        let tenv = layout_cx.typing_env();
         let user_relevant_crates = Self::get_user_relevant_crates(tcx, config);
         let layouts =
             PrimitiveLayouts::new(layout_cx).expect("Couldn't get layouts of primitive types");
@@ -735,6 +737,7 @@ impl<'tcx> MiriMachine<'tcx> {
             RefCell::new(alloc_addresses::GlobalStateInner::new(config, stack_addr, tcx));
         MiriMachine {
             tcx,
+            tenv,
             borrow_tracker,
             data_race,
             alloc_addresses,
@@ -1011,6 +1014,7 @@ impl VisitProvenance for MiriMachine<'_> {
             fds,
             epoll_interests:_,
             tcx: _,
+            tenv: _,
             isolated_op: _,
             validation: _,
             monotonic_clock: _,
